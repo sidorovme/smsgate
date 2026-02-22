@@ -1,0 +1,23 @@
+#pragma once
+
+// ── Wi-Fi ──────────────────────────────────────────────
+#define WIFI_SSID     "MyAwesomeSSID"
+#define WIFI_PASS     "MyAwesomePass"
+
+// ── MQTT ──────────────────────────────────────────────
+#define MQTT_BROKER    "1.2.3.4"
+#define MQTT_PORT      1883
+#define MQTT_TOPIC     "sms/incoming"
+#define DEVICE_ID      "gate-1"
+
+// ── SIM900 UART ────────────────────────────────────────
+#define SIM_RX_PIN    16   // ESP32 RX ← SIM900 TX
+#define SIM_TX_PIN    17   // ESP32 TX → SIM900 RX
+#define SIM_BAUD      115200
+#define SIM_POWER_PIN 4    // HIGH = питание модема включено
+
+// ── Таймауты (мс) ─────────────────────────────────────
+#define AT_TIMEOUT        2000
+#define WIFI_RETRY_MS     5000
+#define POLL_INTERVAL_MS  30000  // опрос SIM на неотправленные SMS
+#define WDT_TIMEOUT_SEC   60

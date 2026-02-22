@@ -1,0 +1,17 @@
+[Unit]
+Description=SMS Gateway Backend (MQTT → Telegram)
+After=network-online.target mosquitto.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=smarthomemaster
+WorkingDirectory=/opt/smsgate-backend
+ExecStart=/opt/smsgate-backend/venv/bin/python main.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
