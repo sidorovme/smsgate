@@ -1,0 +1,17 @@
+mqtt:
+  broker: "192.168.1.2"
+  port: 1883
+
+db_path: "sms.db"
+multipart_timeout_sec: 300
+
+gateways:
+  - name: "gate-1"
+    mqtt_topic: "sms/incoming/gate-1"
+    telegram_bot_token: "123456:ABC-DEF..."
+    telegram_chat_id: "-100123456789"
+
+  - name: "gate-2"
+    mqtt_topic: "sms/incoming/gate-2"
+    telegram_bot_token: "654321:XYZ-UVW..."
+    telegram_chat_id: "-100987654321"

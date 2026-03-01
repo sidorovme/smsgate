@@ -5,6 +5,7 @@
 #include <ArduinoJson.h>
 #include <esp_task_wdt.h>
 #include "config.h"
+#include "display.h"
 
 // ── Глобальные переменные ──────────────────────────────
 HardwareSerial simSerial(2);
@@ -18,6 +19,7 @@ String   lastError     = "";
 bool     sim900Ok      = false;
 uint32_t startTime     = 0;
 uint32_t lastPollMs    = 0;
+uint32_t lastDisplayMs = 0;
 String   simBuffer     = "";
 
 // ── Утилиты AT-команд ──────────────────────────────────
@@ -358,6 +360,9 @@ void setup() {
     Serial.begin(115200);
     Serial.println("\n=== SMS Gateway starting ===");
 
+    // OLED — инициализация первым, чтобы показывать прогресс загрузки
+    displayInit();
+
     // Watchdog
     esp_task_wdt_init(WDT_TIMEOUT_SEC, true);
     esp_task_wdt_add(NULL);
@@ -366,11 +371,13 @@ void setup() {
     WiFi.mode(WIFI_STA);
     WiFi.setAutoReconnect(true);
     ensureWiFi();
+    displayBoot("WiFi", WiFi.status() == WL_CONNECTED);
 
     // MQTT
     mqtt.setServer(MQTT_BROKER, MQTT_PORT);
     mqtt.setBufferSize(1024);
     ensureMQTT();
+    displayBoot("MQTT", mqtt.connected());
 
     // HTTP-сервер
     server.on("/reboot", handleReboot);
@@ -388,15 +395,19 @@ void setup() {
     simSerial.setRxBufferSize(1024);
     simSerial.begin(SIM_BAUD, SERIAL_8N1, SIM_RX_PIN, SIM_TX_PIN);
     if (!initSIM900()) {
+        displayBoot("SIM900", false);
         Serial.println("[SIM] Init failed, will reboot in 10s");
         delay(10000);
         ESP.restart();
     }
+    displayBoot("SIM900", true);
 
     // Проверить SMS оставшиеся на SIM с прошлого раза
     pollPendingSMS();
 
+    displayBootReady();
     Serial.println("=== SMS Gateway ready ===");
+    delay(2000);  // показать boot-экран 2 секунды перед переходом к статусу
 }
 
 void loop() {
@@ -411,5 +422,11 @@ void loop() {
     if (millis() - lastPollMs > POLL_INTERVAL_MS) {
         lastPollMs = millis();
         pollPendingSMS();
+    }
+
+    // Обновление дисплея
+    if (millis() - lastDisplayMs > DISPLAY_UPDATE_MS) {
+        lastDisplayMs = millis();
+        displayStatus();
     }
 }

@@ -29,23 +29,33 @@ running = True
 
 def on_connect(client, userdata, flags, reason_code, properties):
     if reason_code == 0:
-        log.info("MQTT connected, subscribing to %s", config.MQTT_TOPIC)
-        client.subscribe(config.MQTT_TOPIC)
+        for topic in config.GATEWAYS:
+            log.info("MQTT subscribing to %s", topic)
+            client.subscribe(topic)
     else:
         log.error("MQTT connection failed: %s", reason_code)
 
 
 def on_message(client, userdata, msg):
     try:
+        topic = msg.topic
+        gateway = config.GATEWAYS.get(topic)
+        if gateway is None:
+            log.warning("Message from unknown topic: %s", topic)
+            return
+
+        bot_token = gateway["telegram_bot_token"]
+        chat_id = gateway["telegram_chat_id"]
+
         payload = json.loads(msg.payload.decode())
         pdu_hex = payload.get("pdu", "")
         device_id = payload.get("device_id", "unknown")
 
         if not pdu_hex:
-            log.warning("Empty PDU received")
+            log.warning("Empty PDU received on %s", topic)
             return
 
-        log.info("Received PDU from %s (%d chars)", device_id, len(pdu_hex))
+        log.info("Received PDU from %s on %s (%d chars)", device_id, topic, len(pdu_hex))
 
         # Parse PDU
         parsed = pdu_parser.parse(pdu_hex)
@@ -57,7 +67,7 @@ def on_message(client, userdata, msg):
         if multipart is None:
             # Single SMS — save and send immediately
             db.save_single(device_id, sender, text, timestamp)
-            telegram.send(device_id, sender, timestamp, text)
+            telegram.send(device_id, sender, timestamp, text, bot_token, chat_id)
         else:
             # Multipart — save part, try to assemble
             ref = multipart["reference"]
@@ -73,7 +83,7 @@ def on_message(client, userdata, msg):
 
             full_text = db.try_assemble(device_id, sender, ref, total, timestamp)
             if full_text is not None:
-                telegram.send(device_id, sender, timestamp, full_text)
+                telegram.send(device_id, sender, timestamp, full_text, bot_token, chat_id)
 
     except Exception:
         log.exception("Error processing message")

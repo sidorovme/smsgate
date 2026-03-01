@@ -6,8 +6,6 @@ import logging
 
 import requests
 
-import config
-
 log = logging.getLogger(__name__)
 
 
@@ -19,7 +17,8 @@ def _escape_html(text: str) -> str:
     )
 
 
-def send(device_id: str, sender: str, timestamp: str, text: str) -> bool:
+def send(device_id: str, sender: str, timestamp: str, text: str,
+         bot_token: str, chat_id: str) -> bool:
     """
     Send SMS notification to Telegram.
     Returns True if sent successfully.
@@ -32,13 +31,13 @@ def send(device_id: str, sender: str, timestamp: str, text: str) -> bool:
         f"{_escape_html(text)}"
     )
 
-    url = f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/sendMessage"
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
 
     try:
         resp = requests.post(
             url,
             json={
-                "chat_id": config.TELEGRAM_CHAT_ID,
+                "chat_id": chat_id,
                 "text": message,
                 "parse_mode": "HTML",
             },
