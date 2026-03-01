@@ -3,3 +3,6 @@ config.h-*
 .DS_Store
 CLAUDE.md
 gateways.yaml
+embedded/.vscode
+embedded/.pio
+embedded/.claude/*
