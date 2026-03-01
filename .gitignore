@@ -1,6 +1,5 @@
 config.h
 config.h-*
-config.py
 .DS_Store
 CLAUDE.md
 gateways.yaml
