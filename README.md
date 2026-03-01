@@ -5,14 +5,19 @@ SMS-шлюз на базе ESP32 + SIM900: принимает входящие S
 ## Архитектура
 
 ```
-┌─────────────┐     UART      ┌─────────────┐     MQTT        ┌─────────────┐     HTTPS      ┌──────────┐
-│   SIM900    │ ─────────────▶ │    ESP32    │ ──────────────▶ │   Backend   │ ──────────────▶ │ Telegram │
-│  GSM-модем  │   AT-команды   │  Прошивка   │  sms/incoming   │   Python    │   Bot API      │          │
-└─────────────┘                └─────────────┘                 └──────┬──────┘                 └──────────┘
-                                                                      │
-                                                                 ┌────▼────┐
-                                                                 │ SQLite  │
-                                                                 └─────────┘
+┌─────────────┐     UART      ┌─────────────┐     MQTT              ┌─────────────┐     HTTPS      ┌──────────┐
+│   SIM900    │ ─────────────▶ │   ESP32 #1  │ ── sms/incoming/gw1 ─▶│             │ ──────────────▶ │ Telegram │
+│  GSM-модем  │   AT-команды   │  Прошивка   │                       │   Backend   │   Bot API      │ Bot #1   │
+└─────────────┘                └─────────────┘                       │   Python    │                 └──────────┘
+                                                                     │             │
+┌─────────────┐     UART      ┌─────────────┐                       │             │     HTTPS      ┌──────────┐
+│   SIM900    │ ─────────────▶ │   ESP32 #2  │ ── sms/incoming/gw2 ─▶│             │ ──────────────▶ │ Telegram │
+│  GSM-модем  │   AT-команды   │  Прошивка   │                       │             │   Bot API      │ Bot #2   │
+└─────────────┘                └─────────────┘                       └──────┬──────┘                 └──────────┘
+                                                                            │
+                                                                       ┌────▼────┐
+                                                                       │ SQLite  │
+                                                                       └─────────┘
 ```
 
 ## Структура проекта
@@ -30,7 +35,8 @@ smsgate/
 │   ├── pdu_parser.py      # Парсинг SMS PDU (SMSC, отправитель, UDH, текст)
 │   ├── db.py              # SQLite: хранение частей, склейка multipart
 │   ├── telegram.py        # Отправка уведомлений в Telegram
-│   ├── config.py          # Настройки (MQTT, Telegram, БД)
+│   ├── config.py          # Загрузка конфигурации из gateways.yaml
+│   ├── gateways.yaml.example  # Пример конфигурации шлюзов
 │   ├── requirements.txt   # Python-зависимости
 │   └── smsgate-backend.service  # systemd unit-файл
 │
@@ -52,7 +58,7 @@ smsgate/
 1. Включает питание SIM900 через GPIO4 (D4 HIGH)
 2. Подключается к WiFi и MQTT-брокеру
 3. Слушает SIM900 по UART в PDU-режиме
-4. При получении SMS (`+CMTI`) — читает PDU, публикует в MQTT-топик `sms/incoming`
+4. При получении SMS (`+CMTI`) — читает PDU, публикует в свой MQTT-топик (например `sms/incoming/gate-1`)
 5. Удаляет SMS с SIM-карты после успешной отправки
 6. Каждые 30 сек опрашивает SIM на неотправленные SMS (ретрай)
 7. Автоопределение baud rate SIM900 (115200 → 9600)
@@ -88,24 +94,47 @@ pio device monitor          # просмотр логов
 
 ### Что делает
 
-1. Подписывается на MQTT-топик `sms/incoming`
+1. Подписывается на MQTT-топики всех шлюзов (из `gateways.yaml`)
 2. Парсит PDU — извлекает отправителя, текст, timestamp, UDH (multipart-информация)
 3. Поддерживаемые кодировки: **UCS-2** (Unicode), **GSM 7-bit**
-4. Одиночные SMS — сразу сохраняет в БД и отправляет в Telegram
+4. Маршрутизирует SMS в нужный Telegram-чат по MQTT-топику
 5. Multipart SMS — сохраняет части, при получении всех — склеивает и отправляет
 6. Автоочистка незавершённых multipart через 5 минут
 
 ### Настройка
 
-Отредактировать `backend/config.py`:
+Скопировать пример конфигурации и заполнить значения:
 
-```python
-MQTT_BROKER = "1.2.3.4"
-MQTT_PORT = 1883
-MQTT_TOPIC = "sms/incoming"
-TELEGRAM_BOT_TOKEN = "your-bot-token"
-TELEGRAM_CHAT_ID = "your-chat-id"
+```bash
+cd backend
+cp gateways.yaml.example gateways.yaml
 ```
+
+`gateways.yaml` — описание шлюзов и их привязка к Telegram:
+
+```yaml
+mqtt:
+  broker: "192.168.1.2"
+  port: 1883
+
+db_path: "sms.db"
+multipart_timeout_sec: 300
+
+gateways:
+  - name: "gate-1"
+    mqtt_topic: "sms/incoming/gate-1"
+    telegram_bot_token: "123456:ABC-DEF..."
+    telegram_chat_id: "-100123456789"
+
+  - name: "gate-2"
+    mqtt_topic: "sms/incoming/gate-2"
+    telegram_bot_token: "654321:XYZ-UVW..."
+    telegram_chat_id: "-100987654321"
+```
+
+Каждый шлюз публикует SMS в свой MQTT-топик, бэкенд маршрутизирует их в соответствующий Telegram-бот/чат.
+
+Путь к конфигу можно переопределить через переменную окружения `SMSGATE_CONFIG`.
 
 ### Установка и запуск
 
@@ -114,6 +143,7 @@ cd backend
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
+cp gateways.yaml.example gateways.yaml  # заполнить свои значения
 python main.py
 ```
 
