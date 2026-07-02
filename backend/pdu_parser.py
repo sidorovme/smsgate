@@ -154,14 +154,16 @@ def parse(pdu_hex: str) -> dict:
     pos += 1
 
     oa_bytes_count = (oa_len + 1) // 2
-    oa_number = _decode_semi_octet(data[pos : pos + oa_bytes_count])
+    oa_data = data[pos : pos + oa_bytes_count]
     pos += oa_bytes_count
 
-    # Format phone number
-    if (oa_type & 0x70) == 0x10:  # international
-        sender = "+" + oa_number
+    if (oa_type & 0x70) == 0x50:  # alphanumeric (GSM 7-bit packed)
+        # oa_len is in semi-octets, so 7-bit chars = oa_len * 4 // 7
+        sender = _decode_gsm7(oa_data, (oa_len * 4) // 7)
+    elif (oa_type & 0x70) == 0x10:  # international
+        sender = "+" + _decode_semi_octet(oa_data)
     else:
-        sender = oa_number
+        sender = _decode_semi_octet(oa_data)
 
     # ── TP-PID ─────────────────────────────────────────
     pos += 1  # Protocol Identifier
