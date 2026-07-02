@@ -23,8 +23,8 @@ def send(
     message = (
         f"{_escape_html(text)}\n\n"
         f"<b>From:</b> {_escape_html(sender)}\n"
-        f"<b>Time:</b> {_escape_html(timestamp)}\n\n"
-        f"<b>SIM:</b> {_escape_html(device_id)}\n"
+        f"<b>At:</b> {_escape_html(timestamp)}\n\n"
+        f"<b>Via:</b> {_escape_html(device_id)}\n"
     )
 
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
