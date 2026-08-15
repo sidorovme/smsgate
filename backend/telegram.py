@@ -23,7 +23,7 @@ def send(
     message = (
         f"{_escape_html(text)}\n\n"
         f"<b>From:</b> {_escape_html(sender)}\n"
-        f"<b>At:</b> {_escape_html(timestamp)}\n\n"
+        f"<b>At:</b> {_escape_html(timestamp)}\n"
         f"<b>Via:</b> {_escape_html(device_id)}\n"
     )
 
