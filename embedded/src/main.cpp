@@ -1,7 +1,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <PubSubClient.h>
-#include <WebServer.h>
 #include <ArduinoJson.h>
 #include <esp_task_wdt.h>
 #include "config.h"
@@ -9,7 +8,6 @@
 
 // ── Глобальные переменные ──────────────────────────────
 HardwareSerial simSerial(2);
-WebServer server(80);
 WiFiClient wifiClient;
 PubSubClient mqtt(wifiClient);
 
@@ -20,7 +18,17 @@ bool     sim900Ok      = false;
 uint32_t startTime     = 0;
 uint32_t lastPollMs    = 0;
 uint32_t lastDisplayMs = 0;
+uint32_t lastStatusMs  = 0;
+uint32_t lastMqttMs    = 0;   // троттлинг попыток реконнекта к брокеру
 String   simBuffer     = "";
+
+// Команды из MQTT выполняются в loop(), а не в callback (тяжёлая работа
+// внутри колбэка PubSubClient нежелательна).
+enum PendingCmd { CMD_NONE, CMD_REBOOT, CMD_RESET_MODEM };
+volatile PendingCmd pendingCmd = CMD_NONE;
+
+// ── Предварительные объявления ─────────────────────────
+void publishStatus();
 
 // ── Утилиты AT-команд ──────────────────────────────────
 
@@ -123,9 +131,18 @@ void ensureMQTT() {
     if (mqtt.connected()) return;
     if (WiFi.status() != WL_CONNECTED) return;
 
+    // Не долбить брокер каждым тиком loop() — попытка connect() блокирующая.
+    if (lastMqttMs != 0 && millis() - lastMqttMs < MQTT_RETRY_MS) return;
+    lastMqttMs = millis();
+
     Serial.printf("[MQTT] Connecting to %s:%d...\n", MQTT_BROKER, MQTT_PORT);
-    if (mqtt.connect(DEVICE_ID)) {
+    // LWT: при неожиданном обрыве брокер сам опубликует "offline" (retained).
+    if (mqtt.connect(DEVICE_ID, MQTT_AVAILABILITY_TOPIC, 0, true, "offline")) {
         Serial.println("[MQTT] Connected");
+        mqtt.publish(MQTT_AVAILABILITY_TOPIC, "online", true); // birth-сообщение
+        mqtt.subscribe(MQTT_CMD_TOPIC);
+        Serial.printf("[MQTT] Subscribed to %s\n", MQTT_CMD_TOPIC);
+        publishStatus();
     } else {
         Serial.printf("[MQTT] Failed, rc=%d\n", mqtt.state());
     }
@@ -301,17 +318,41 @@ void pollPendingSMS() {
     }
 }
 
-// ── HTTP-ручки ─────────────────────────────────────────
+// ── Статус и команды через MQTT ────────────────────────
 
-void handleReboot() {
-    server.send(200, "text/plain", "Rebooting...");
-    delay(500);
+// Публикует метрики устройства в MQTT_STATUS_TOPIC (retained).
+void publishStatus() {
+    if (!mqtt.connected()) return;
+
+    JsonDocument doc;
+    doc["uptime_sec"]    = (millis() - startTime) / 1000;
+    doc["wifi_rssi"]     = WiFi.RSSI();
+    doc["wifi_ip"]       = WiFi.localIP().toString();
+    doc["sms_forwarded"] = smsForwarded;
+    doc["sms_pending"]   = smsPending;
+    doc["last_error"]    = lastError;
+    doc["free_heap"]     = ESP.getFreeHeap();
+    doc["sim900_ok"]     = sim900Ok;
+
+    String body;
+    serializeJson(doc, body);
+    mqtt.publish(MQTT_STATUS_TOPIC, body.c_str(), true); // retained
+}
+
+// Перезагрузка ESP32 (команда reboot).
+void doReboot() {
+    Serial.println("[CMD] Reboot requested");
+    if (mqtt.connected()) {
+        mqtt.publish(MQTT_AVAILABILITY_TOPIC, "offline", true);
+        mqtt.loop(); // дать библиотеке отправить сообщение перед рестартом
+    }
+    delay(200);
     ESP.restart();
 }
 
-void handleResetModem() {
-    Serial.println("[HTTP] /reset-modem: power cycling modem...");
-    server.send(200, "text/plain", "Modem reset started...");
+// Power cycle модема SIM900 и переинициализация (команда reset-modem).
+void resetModem() {
+    Serial.println("[CMD] reset-modem: power cycling modem...");
 
     sim900Ok = false;
 
@@ -334,22 +375,29 @@ void handleResetModem() {
         Serial.println("[SIM] Reset FAILED");
         lastError = "Modem reset failed";
     }
+
+    publishStatus();
 }
 
-void handleStatus() {
-    JsonDocument doc;
-    doc["uptime_sec"]    = (millis() - startTime) / 1000;
-    doc["wifi_rssi"]     = WiFi.RSSI();
-    doc["wifi_ip"]       = WiFi.localIP().toString();
-    doc["sms_forwarded"] = smsForwarded;
-    doc["sms_pending"]   = smsPending;
-    doc["last_error"]    = lastError;
-    doc["free_heap"]     = ESP.getFreeHeap();
-    doc["sim900_ok"]     = sim900Ok;
+// Callback входящих MQTT-сообщений на MQTT_CMD_TOPIC.
+// Только помечает команду; выполнение — в loop().
+void onMqttMessage(char* topic, byte* payload, unsigned int length) {
+    String cmd;
+    cmd.reserve(length);
+    for (unsigned int i = 0; i < length; i++) cmd += (char)payload[i];
+    cmd.trim();
 
-    String body;
-    serializeJson(doc, body);
-    server.send(200, "application/json", body);
+    Serial.printf("[MQTT] Command on %s: %s\n", topic, cmd.c_str());
+
+    if (cmd == "reboot") {
+        pendingCmd = CMD_REBOOT;
+    } else if (cmd == "reset-modem") {
+        pendingCmd = CMD_RESET_MODEM;
+    } else if (cmd == "status") {
+        publishStatus();
+    } else {
+        Serial.printf("[MQTT] Unknown command: %s\n", cmd.c_str());
+    }
 }
 
 // ── Setup / Loop ───────────────────────────────────────
@@ -376,15 +424,9 @@ void setup() {
     // MQTT
     mqtt.setServer(MQTT_BROKER, MQTT_PORT);
     mqtt.setBufferSize(1024);
+    mqtt.setCallback(onMqttMessage);
     ensureMQTT();
     displayBoot("MQTT", mqtt.connected());
-
-    // HTTP-сервер
-    server.on("/reboot", handleReboot);
-    server.on("/status", handleStatus);
-    server.on("/reset-modem", handleResetModem);
-    server.begin();
-    Serial.println("[HTTP] Server started on port 80");
 
     // SIM900 — включить питание модема
     pinMode(SIM_POWER_PIN, OUTPUT);
@@ -404,6 +446,7 @@ void setup() {
 
     // Проверить SMS оставшиеся на SIM с прошлого раза
     pollPendingSMS();
+    publishStatus();
 
     displayBootReady();
     Serial.println("=== SMS Gateway ready ===");
@@ -413,15 +456,30 @@ void setup() {
 void loop() {
     esp_task_wdt_reset();
 
-    server.handleClient();
     ensureWiFi();
+    ensureMQTT();
     mqtt.loop();
     processSIMData();
+
+    // Отложенные команды из MQTT
+    if (pendingCmd == CMD_REBOOT) {
+        pendingCmd = CMD_NONE;
+        doReboot();
+    } else if (pendingCmd == CMD_RESET_MODEM) {
+        pendingCmd = CMD_NONE;
+        resetModem();
+    }
 
     // Периодический опрос неотправленных SMS
     if (millis() - lastPollMs > POLL_INTERVAL_MS) {
         lastPollMs = millis();
         pollPendingSMS();
+    }
+
+    // Периодическая публикация статуса в MQTT
+    if (millis() - lastStatusMs > STATUS_INTERVAL_MS) {
+        lastStatusMs = millis();
+        publishStatus();
     }
 
     // Обновление дисплея

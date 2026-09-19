@@ -26,19 +26,61 @@ log = logging.getLogger("smsgate")
 
 running = True
 
+# Последнее известное состояние доступности по topic (для детекта переходов)
+_availability = {}
+
 
 def on_connect(client, userdata, flags, reason_code, properties):
     if reason_code == 0:
         for topic in config.GATEWAYS:
             log.info("MQTT subscribing to %s", topic)
             client.subscribe(topic)
+        for topic in config.AVAILABILITY_TOPICS:
+            log.info("MQTT subscribing to %s", topic)
+            client.subscribe(topic)
     else:
         log.error("MQTT connection failed: %s", reason_code)
+
+
+def handle_availability(topic, msg):
+    """React to a gateway's LWT/birth message: alert Telegram on transitions."""
+    gateway = config.AVAILABILITY_TOPICS.get(topic)
+    if gateway is None:
+        return
+
+    state = msg.payload.decode(errors="replace").strip().lower()
+    if state not in ("online", "offline"):
+        log.warning("Unknown availability payload on %s: %r", topic, state)
+        return
+
+    prev = _availability.get(topic)
+    _availability[topic] = state
+
+    if prev == state:
+        return  # без изменений (в т.ч. дубликат retained-сообщения)
+
+    if prev is None and state == "online":
+        # первое известие о шлюзе, он в сети — это норма, не шумим
+        log.info("Gateway %s is online (baseline)", gateway["name"])
+        return
+
+    log.info("Gateway %s availability: %s -> %s", gateway["name"], prev, state)
+    telegram.send_availability(
+        gateway["name"],
+        state == "online",
+        gateway["telegram_bot_token"],
+        gateway["telegram_chat_id"],
+    )
 
 
 def on_message(client, userdata, msg):
     try:
         topic = msg.topic
+
+        if topic in config.AVAILABILITY_TOPICS:
+            handle_availability(topic, msg)
+            return
+
         gateway = config.GATEWAYS.get(topic)
         if gateway is None:
             log.warning("Message from unknown topic: %s", topic)

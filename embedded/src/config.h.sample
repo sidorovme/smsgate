@@ -7,7 +7,10 @@
 // ── MQTT ──────────────────────────────────────────────
 #define MQTT_BROKER    "1.2.3.4"
 #define MQTT_PORT      1883
-#define MQTT_TOPIC     "sms/incoming"
+#define MQTT_TOPIC              "sms/incoming"             // входящие SMS (PDU)
+#define MQTT_STATUS_TOPIC       "sms/status"               // метрики устройства (retained)
+#define MQTT_AVAILABILITY_TOPIC "sms/status/availability"  // online/offline (LWT, retained)
+#define MQTT_CMD_TOPIC          "sms/cmd"                  // команды: reboot, reset-modem, status
 #define DEVICE_ID      "gate-1"
 
 // ── SIM900 UART ────────────────────────────────────────
@@ -17,7 +20,9 @@
 #define SIM_POWER_PIN 4    // HIGH = питание модема включено
 
 // ── Таймауты (мс) ─────────────────────────────────────
-#define AT_TIMEOUT        2000
-#define WIFI_RETRY_MS     5000
-#define POLL_INTERVAL_MS  30000  // опрос SIM на неотправленные SMS
-#define WDT_TIMEOUT_SEC   60
+#define AT_TIMEOUT         2000
+#define WIFI_RETRY_MS      5000
+#define MQTT_RETRY_MS      5000   // пауза между попытками реконнекта к брокеру
+#define POLL_INTERVAL_MS   30000  // опрос SIM на неотправленные SMS
+#define STATUS_INTERVAL_MS 30000  // публикация статуса в MQTT
+#define WDT_TIMEOUT_SEC    60

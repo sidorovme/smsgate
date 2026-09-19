@@ -32,11 +32,23 @@ DB_PATH = _raw.get("db_path", "sms.db")
 # ── Multipart ────────────────────────────────────────
 MULTIPART_TIMEOUT_SEC = _raw.get("multipart_timeout_sec", 300)
 
-# ── Gateways: {mqtt_topic: {name, telegram_bot_token, telegram_chat_id}} ──
+# ── Gateways ──────────────────────────────────────────
+# GATEWAYS:            {mqtt_topic:        {name, telegram_bot_token, telegram_chat_id}}
+# AVAILABILITY_TOPICS: {availability_topic: {name, telegram_bot_token, telegram_chat_id}}
+#
+# availability_topic по умолчанию выводится из mqtt_topic
+# (sms/incoming/<x> → sms/status/<x>/availability), но может быть задан явно.
 GATEWAYS = {}
+AVAILABILITY_TOPICS = {}
 for gw in _raw["gateways"]:
-    GATEWAYS[gw["mqtt_topic"]] = {
+    entry = {
         "name": gw["name"],
         "telegram_bot_token": gw["telegram_bot_token"],
         "telegram_chat_id": str(gw["telegram_chat_id"]),
     }
+    mqtt_topic = gw["mqtt_topic"]
+    availability_topic = gw.get("availability_topic") or (
+        mqtt_topic.replace("/incoming/", "/status/") + "/availability"
+    )
+    GATEWAYS[mqtt_topic] = entry
+    AVAILABILITY_TOPICS[availability_topic] = entry

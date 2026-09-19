@@ -5,9 +5,13 @@ mqtt:
 db_path: "sms.db"
 multipart_timeout_sec: 300
 
+# availability_topic — топик keep-alive/LWT шлюза (online/offline).
+# По умолчанию выводится из mqtt_topic: sms/incoming/<x> → sms/status/<x>/availability.
+# Задавайте явно, только если топик в прошивке отличается от этой схемы.
 gateways:
   - name: "gate-1"
     mqtt_topic: "sms/incoming/gate-1"
+    # availability_topic: "sms/status/gate-1/availability"
     telegram_bot_token: "123456:ABC-DEF..."
     telegram_chat_id: "-100123456789"
 
