@@ -172,3 +172,32 @@ def _safe_error(e: Exception) -> str:
     if resp is not None:
         return f"HTTP {resp.status_code}"
     return type(e).__name__
+
+
+BOT_COMMANDS = [
+    {"command": "status", "description": "Состояние шлюза"},
+    {"command": "send", "description": "Отправить SMS: /send +375... текст"},
+    {"command": "reboot", "description": "Перезагрузить шлюз"},
+    {"command": "reset_modem", "description": "Перезапустить модем"},
+    {"command": "help", "description": "Список команд"},
+]
+
+
+def set_commands(name: str, bot_token: str, chat_id: str) -> bool:
+    """Register the bot command menu for the gateway's chat only (setMyCommands, chat scope)."""
+    try:
+        resp = requests.post(
+            f"https://api.telegram.org/bot{bot_token}/setMyCommands",
+            json={
+                "commands": BOT_COMMANDS,
+                "scope": {"type": "chat", "chat_id": chat_id},
+            },
+            timeout=10,
+        )
+        if resp.ok:
+            log.info("[%s] Telegram command menu registered", name)
+            return True
+        log.error("[%s] setMyCommands failed: HTTP %d %s", name, resp.status_code, resp.text)
+    except Exception as e:
+        log.error("[%s] setMyCommands failed: %s", name, _safe_error(e))
+    return False

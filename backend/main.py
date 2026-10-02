@@ -484,6 +484,10 @@ def main():
     cleanup_thread = threading.Thread(target=cleanup_loop, daemon=True)
     cleanup_thread.start()
 
+    # Меню команд бота — только в чате своего шлюза
+    for gw in config.BOTS:
+        telegram.set_commands(gw["name"], gw["telegram_bot_token"], gw["telegram_chat_id"])
+
     # Telegram: приём команд /send. Один поток на токен бота (getUpdates — один потребитель
     # на бота), чаты шлюзов с общим токеном обслуживаются одним потоком.
     by_token = {}
