@@ -121,19 +121,20 @@ def _get_updates(bot_token: str, offset, timeout: int):
     return resp.json().get("result", [])
 
 
-def poll_commands(name: str, bot_token: str, chat_id: str, handler, is_running):
+def poll_commands(name: str, bot_token: str, handlers: dict, is_running):
     """
-    Long-poll a bot and call handler(text) for each text message from the authorized chat.
-    Messages from other chats are ignored. Backlog accumulated while the backend was down
-    is discarded, so a stale /send is never executed late.
+    Long-poll a bot and dispatch text messages to handlers[chat_id](text).
+    Messages from chats without a handler are ignored. Backlog accumulated while the
+    backend was down is discarded, so a stale /send is never executed late.
+    One poller per token: Telegram allows only one getUpdates consumer per bot (409 otherwise).
     """
     offset = None
     try:
         backlog = _get_updates(bot_token, -1, 0)
         if backlog:
             offset = backlog[-1]["update_id"] + 1
-    except Exception:
-        log.exception("[%s] Telegram: failed to skip backlog", name)
+    except Exception as e:
+        log.error("[%s] Telegram: failed to skip backlog: %s", name, _safe_error(e))
 
     while is_running():
         try:
@@ -142,7 +143,8 @@ def poll_commands(name: str, bot_token: str, chat_id: str, handler, is_running):
                 msg = upd.get("message")
                 if not msg or "text" not in msg:
                     continue
-                if str(msg["chat"]["id"]) != chat_id:
+                handler = handlers.get(str(msg["chat"]["id"]))
+                if handler is None:
                     log.warning("[%s] Telegram: ignoring message from chat %s", name, msg["chat"]["id"])
                     continue
                 if time.time() - msg.get("date", 0) > 120:
@@ -151,6 +153,22 @@ def poll_commands(name: str, bot_token: str, chat_id: str, handler, is_running):
                     handler(msg["text"])
                 except Exception:
                     log.exception("[%s] Telegram command handler failed", name)
-        except Exception:
-            log.exception("[%s] Telegram polling error", name)
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code == 409:
+                log.error("[%s] Telegram 409: another getUpdates consumer or webhook uses this "
+                          "bot token (second backend instance? webhook set?)", name)
+                time.sleep(30)
+            else:
+                log.error("[%s] Telegram polling error: %s", name, _safe_error(e))
+                time.sleep(5)
+        except Exception as e:
+            log.error("[%s] Telegram polling error: %s", name, _safe_error(e))
             time.sleep(5)
+
+
+def _safe_error(e: Exception) -> str:
+    """Error text without the request URL (it contains the bot token)."""
+    resp = getattr(e, "response", None)
+    if resp is not None:
+        return f"HTTP {resp.status_code}"
+    return type(e).__name__

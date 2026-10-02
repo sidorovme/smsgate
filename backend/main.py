@@ -378,17 +378,18 @@ def main():
     cleanup_thread = threading.Thread(target=cleanup_loop, daemon=True)
     cleanup_thread.start()
 
-    # Telegram: приём команд /send (по потоку на бота)
+    # Telegram: приём команд /send. Один поток на токен бота (getUpdates — один потребитель
+    # на бота), чаты шлюзов с общим токеном обслуживаются одним потоком.
+    by_token = {}
     for gw in config.BOTS:
+        by_token.setdefault(gw["telegram_bot_token"], {})[gw["telegram_chat_id"]] = (
+            lambda text, gw=gw: handle_send_command(gw, text)
+        )
+    for token, handlers in by_token.items():
+        label = ",".join(gw["name"] for gw in config.BOTS if gw["telegram_bot_token"] == token)
         threading.Thread(
             target=telegram.poll_commands,
-            args=(
-                gw["name"],
-                gw["telegram_bot_token"],
-                gw["telegram_chat_id"],
-                lambda text, gw=gw: handle_send_command(gw, text),
-                lambda: running,
-            ),
+            args=(label, token, handlers, lambda: running),
             daemon=True,
         ).start()
 
