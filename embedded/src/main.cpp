@@ -22,6 +22,15 @@ uint32_t lastStatusMs  = 0;
 uint32_t lastMqttMs    = 0;   // троттлинг попыток реконнекта к брокеру
 String   simBuffer     = "";
 
+// Состояние сотовой сети (AT+CREG? / AT+COPS? / AT+CSQ)
+#ifndef NET_CHECK_MS
+#define NET_CHECK_MS 15000
+#endif
+int      netStat       = -1;   // CREG stat: 0 нет, 1 home, 2 поиск, 3 отказ, 4 ?, 5 roaming; -1 неизвестно
+String   netOperator   = "";
+int      netCsq        = 99;   // 0..31, 99 = неизвестно
+uint32_t lastNetMs     = 0;
+
 // Команды из MQTT выполняются в loop(), а не в callback (тяжёлая работа
 // внутри колбэка PubSubClient нежелательна).
 enum PendingCmd { CMD_NONE, CMD_REBOOT, CMD_RESET_MODEM };
@@ -318,6 +327,38 @@ void pollPendingSMS() {
     }
 }
 
+// ── Состояние сотовой сети ─────────────────────────────
+
+// Опрашивает регистрацию в сети, оператора и уровень сигнала.
+// Возвращает true, если регистрация/оператор изменились.
+bool updateNetwork() {
+    int oldStat = netStat;
+    String oldOp = netOperator;
+
+    String r = sendAT("AT+CREG?");
+    int p = r.indexOf("+CREG:");
+    if (p != -1) {
+        int comma = r.indexOf(',', p);
+        if (comma != -1) netStat = r.substring(comma + 1).toInt();
+    }
+
+    netOperator = "";
+    if (netStat == 1 || netStat == 5) {
+        String o = sendAT("AT+COPS?");
+        int q1 = o.indexOf('"');
+        int q2 = q1 == -1 ? -1 : o.indexOf('"', q1 + 1);
+        if (q2 != -1) netOperator = o.substring(q1 + 1, q2);
+
+        String c = sendAT("AT+CSQ");
+        int cp = c.indexOf("+CSQ:");
+        if (cp != -1) netCsq = c.substring(cp + 5).toInt();
+    } else {
+        netCsq = 99;
+    }
+
+    return netStat != oldStat || netOperator != oldOp;
+}
+
 // ── Статус и команды через MQTT ────────────────────────
 
 // Публикует метрики устройства в MQTT_STATUS_TOPIC (retained).
@@ -333,6 +374,11 @@ void publishStatus() {
     doc["last_error"]    = lastError;
     doc["free_heap"]     = ESP.getFreeHeap();
     doc["sim900_ok"]     = sim900Ok;
+    doc["net_stat"]      = netStat;
+    doc["net_registered"] = (netStat == 1 || netStat == 5);
+    doc["net_roaming"]   = (netStat == 5);
+    doc["net_operator"]  = netOperator;
+    doc["net_csq"]       = netCsq;
 
     String body;
     serializeJson(doc, body);
@@ -355,6 +401,8 @@ void resetModem() {
     Serial.println("[CMD] reset-modem: power cycling modem...");
 
     sim900Ok = false;
+    netStat = -1;
+    netOperator = "";
 
     // Выключить питание
     digitalWrite(SIM_POWER_PIN, LOW);
@@ -446,6 +494,7 @@ void setup() {
 
     // Проверить SMS оставшиеся на SIM с прошлого раза
     pollPendingSMS();
+    updateNetwork();
     publishStatus();
 
     displayBootReady();
@@ -474,6 +523,12 @@ void loop() {
     if (millis() - lastPollMs > POLL_INTERVAL_MS) {
         lastPollMs = millis();
         pollPendingSMS();
+    }
+
+    // Состояние сотовой сети; при изменении — сразу публикуем статус
+    if (sim900Ok && millis() - lastNetMs > NET_CHECK_MS) {
+        lastNetMs = millis();
+        if (updateNetwork()) publishStatus();
     }
 
     // Периодическая публикация статуса в MQTT

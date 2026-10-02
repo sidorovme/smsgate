@@ -40,6 +40,7 @@ MULTIPART_TIMEOUT_SEC = _raw.get("multipart_timeout_sec", 300)
 # (sms/incoming/<x> → sms/status/<x>/availability), но может быть задан явно.
 GATEWAYS = {}
 AVAILABILITY_TOPICS = {}
+STATUS_TOPICS = {}  # sms/status/<x> — метрики устройства, в т.ч. состояние сотовой сети
 for gw in _raw["gateways"]:
     entry = {
         "name": gw["name"],
@@ -50,5 +51,7 @@ for gw in _raw["gateways"]:
     availability_topic = gw.get("availability_topic") or (
         mqtt_topic.replace("/incoming/", "/status/") + "/availability"
     )
+    status_topic = gw.get("status_topic") or mqtt_topic.replace("/incoming/", "/status/")
     GATEWAYS[mqtt_topic] = entry
+    STATUS_TOPICS[status_topic] = entry
     AVAILABILITY_TOPICS[availability_topic] = entry

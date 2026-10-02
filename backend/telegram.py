@@ -70,3 +70,33 @@ def send_availability(name: str, online: bool, bot_token: str, chat_id: str) -> 
         log.info("Telegram alert: %s -> %s", name, "online" if online else "offline")
         return True
     return False
+
+
+def send_network(
+    name: str,
+    registered: bool,
+    operator: str,
+    roaming: bool,
+    prev_operator,
+    bot_token: str,
+    chat_id: str,
+) -> bool:
+    """Notify Telegram about SIM network registration changes. Returns True on success."""
+    n = _escape_html(name)
+    op = _escape_html(operator) if operator else "неизвестный оператор"
+    if not registered:
+        message = f"📵 <b>{n}</b>: SIM-карта отключена от сети"
+    elif prev_operator is not None and prev_operator != operator:
+        message = (
+            f"🔄 <b>{n}</b>: смена оператора "
+            f"{_escape_html(prev_operator) or '?'} → {op}"
+        )
+    else:
+        message = f"📶 <b>{n}</b>: SIM-карта в сети — {op}"
+    if registered and roaming:
+        message += " (роуминг)"
+
+    if _post(bot_token, chat_id, message):
+        log.info("Telegram alert: %s network registered=%s operator=%s", name, registered, operator)
+        return True
+    return False

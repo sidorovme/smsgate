@@ -29,6 +29,9 @@ running = True
 # Последнее известное состояние доступности по topic (для детекта переходов)
 _availability = {}
 
+# Последнее известное состояние сотовой сети по status-топику: (registered, operator)
+_network = {}
+
 
 def on_connect(client, userdata, flags, reason_code, properties):
     if reason_code == 0:
@@ -36,6 +39,9 @@ def on_connect(client, userdata, flags, reason_code, properties):
             log.info("MQTT subscribing to %s", topic)
             client.subscribe(topic)
         for topic in config.AVAILABILITY_TOPICS:
+            log.info("MQTT subscribing to %s", topic)
+            client.subscribe(topic)
+        for topic in config.STATUS_TOPICS:
             log.info("MQTT subscribing to %s", topic)
             client.subscribe(topic)
     else:
@@ -73,9 +79,53 @@ def handle_availability(topic, msg):
     )
 
 
+def handle_status(topic, msg):
+    """Track cellular network registration/operator; alert Telegram on changes."""
+    gateway = config.STATUS_TOPICS.get(topic)
+    if gateway is None:
+        return
+
+    status = json.loads(msg.payload.decode())
+    if status.get("net_stat", -1) == -1:
+        return  # прошивка без поддержки или модем ещё не опрошен
+
+    registered = bool(status.get("net_registered"))
+    operator = status.get("net_operator") or ""
+    roaming = bool(status.get("net_roaming"))
+
+    prev = _network.get(topic)
+    _network[topic] = (registered, operator)
+
+    if prev == (registered, operator):
+        return
+
+    if prev is None:
+        # первое известие: нормальное состояние не комментируем, проблему — сообщаем
+        log.info("Gateway %s network baseline: registered=%s operator=%s",
+                 gateway["name"], registered, operator)
+        if registered:
+            return
+    else:
+        log.info("Gateway %s network: %s -> %s", gateway["name"], prev, (registered, operator))
+
+    telegram.send_network(
+        gateway["name"],
+        registered,
+        operator,
+        roaming,
+        prev[1] if prev and prev[0] else None,
+        gateway["telegram_bot_token"],
+        gateway["telegram_chat_id"],
+    )
+
+
 def on_message(client, userdata, msg):
     try:
         topic = msg.topic
+
+        if topic in config.STATUS_TOPICS:
+            handle_status(topic, msg)
+            return
 
         if topic in config.AVAILABILITY_TOPICS:
             handle_availability(topic, msg)
