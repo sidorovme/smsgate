@@ -40,7 +40,17 @@ _send_times = defaultdict(deque)  # gateway name -> времена послед�
 _send_lock = threading.Lock()
 _ref_counter = random.randint(1, 255)  # TP-reference для UDH (multipart)
 
+_status_cache = {}     # status topic -> (время получения, dict последнего статуса шлюза)
+_expected_offline = {}  # availability topic -> время команды reboot (подавляем алерт offline)
+EXPECTED_REBOOT_SEC = 60
+
 USAGE = "Использование: <code>/send +375291234567 Текст сообщения</code>"
+HELP = (
+    "/send <code>+375291234567 текст</code> — отправить SMS\n"
+    "/status — состояние шлюза\n"
+    "/reboot — перезагрузить шлюз\n"
+    "/reset_modem — перезапустить модем"
+)
 
 
 def on_connect(client, userdata, flags, reason_code, properties):
@@ -85,6 +95,8 @@ def handle_availability(topic, msg):
         return
 
     log.info("Gateway %s availability: %s -> %s", gateway["name"], prev, state)
+    if state == "offline" and time.time() - _expected_offline.pop(topic, 0) < EXPECTED_REBOOT_SEC:
+        return  # плановая перезагрузка по команде из Telegram — не алертим, придёт «снова в сети»
     telegram.send_availability(
         gateway["name"],
         state == "online",
@@ -100,6 +112,7 @@ def handle_status(topic, msg):
         return
 
     status = json.loads(msg.payload.decode())
+    _status_cache[topic] = (time.time(), status)
     if status.get("net_stat", -1) == -1:
         return  # прошивка без поддержки или модем ещё не опрошен
 
@@ -158,11 +171,104 @@ def _rate_limited(gateway):
         return False
 
 
-def handle_send_command(gateway, text):
-    """Handle '/send <number> <text>' from the gateway's authorized Telegram chat."""
+def handle_command(gateway, text):
+    """Dispatch a Telegram command from the gateway's authorized chat."""
     parts = text.strip().split(None, 2)
-    if not parts or parts[0].split("@")[0].lower() != "/send":
+    if not parts or not parts[0].startswith("/"):
         return
+    cmd = parts[0].split("@")[0].lower()
+    if cmd == "/send":
+        handle_send_command(gateway, parts)
+    elif cmd == "/status":
+        handle_status_command(gateway)
+    elif cmd in ("/reboot", "/reset_modem", "/reset-modem"):
+        handle_control_command(gateway, "reboot" if cmd == "/reboot" else "reset-modem")
+    elif cmd in ("/help", "/start"):
+        _reply(gateway, HELP)
+
+
+def _fmt_uptime(sec):
+    d, rem = divmod(int(sec), 86400)
+    h, rem = divmod(rem, 3600)
+    return (f"{d}д " if d else "") + f"{h}ч {rem // 60}м"
+
+
+def _fmt_status(gateway, online, age, st):
+    esc = telegram.escape_html
+    lines = [f"<b>{esc(gateway['name'])}</b> — {'🟢 online' if online else '🔴 offline'}"]
+    if not online:
+        lines.append(f"<i>последние известные данные ({_fmt_uptime(age)} назад)</i>")
+
+    if st.get("net_stat", -1) == -1:
+        net = "нет данных"
+    elif st.get("net_registered"):
+        net = esc(st.get("net_operator") or "?") + (" (роуминг)" if st.get("net_roaming") else "")
+    else:
+        net = "❌ не зарегистрирована"
+    lines.append(f"SIM: {net}")
+
+    csq = st.get("net_csq", 99)
+    if csq != 99 and st.get("net_registered"):
+        lines.append(f"Сигнал: {-113 + 2 * csq} dBm (CSQ {csq}/31)")
+
+    lines.append(f"Модем: {'OK' if st.get('sim900_ok') else '❌ не отвечает'}")
+    lines.append(f"Wi-Fi: {st.get('wifi_rssi')} dBm, {esc(str(st.get('wifi_ip', '?')))}")
+    lines.append(f"Uptime: {_fmt_uptime(st.get('uptime_sec', 0))}")
+    lines.append(
+        f"SMS: принято {st.get('sms_forwarded', 0)}, отправлено {st.get('sms_sent', 0)}, "
+        f"в очереди на SIM {st.get('sms_pending', 0)}"
+    )
+    if st.get("last_error"):
+        lines.append(f"Последняя ошибка: {esc(str(st['last_error']))}")
+    lines.append(f"Heap: {st.get('free_heap', 0) // 1024} КБ")
+    return "\n".join(lines)
+
+
+def handle_status_command(gateway):
+    """Ask the gateway for fresh metrics and reply with a summary."""
+    online = _availability.get(gateway["availability_topic"]) == "online"
+    asked = time.time()
+    if online:
+        _client.publish(gateway["cmd_topic"], "status")
+        deadline = asked + 5
+        while time.time() < deadline:
+            cached = _status_cache.get(gateway["status_topic"])
+            if cached and cached[0] >= asked:
+                break
+            time.sleep(0.2)
+
+    cached = _status_cache.get(gateway["status_topic"])
+    if cached is None:
+        _reply(gateway, f"Нет данных о <b>{telegram.escape_html(gateway['name'])}</b>")
+        return
+    ts, st = cached
+    _reply(gateway, _fmt_status(gateway, online, time.time() - ts, st))
+
+
+def handle_control_command(gateway, command):
+    """Forward reboot / reset-modem to the gateway (only if it is online)."""
+    name = telegram.escape_html(gateway["name"])
+    if _availability.get(gateway["availability_topic"]) != "online":
+        _reply(gateway, f"❌ <b>{name}</b> недоступен (offline), команда не отправлена.")
+        return
+
+    if command == "reboot":
+        _expected_offline[gateway["availability_topic"]] = time.time()
+    info = _client.publish(gateway["cmd_topic"], command, qos=1)
+    if info.rc != mqtt.MQTT_ERR_SUCCESS:
+        _expected_offline.pop(gateway["availability_topic"], None)
+        _reply(gateway, "❌ Не удалось передать команду шлюзу (MQTT).")
+        return
+
+    log.info("Command %s sent to %s", command, gateway["name"])
+    if command == "reboot":
+        _reply(gateway, f"🔄 Перезагружаю <b>{name}</b>, сообщу, когда вернётся в сеть.")
+    else:
+        _reply(gateway, f"🔄 Перезапускаю модем <b>{name}</b> (около 10–15 с).")
+
+
+def handle_send_command(gateway, parts):
+    """Handle '/send <number> <text>' (parts = text.split(None, 2))."""
     if len(parts) < 3:
         _reply(gateway, USAGE)
         return
@@ -383,7 +489,7 @@ def main():
     by_token = {}
     for gw in config.BOTS:
         by_token.setdefault(gw["telegram_bot_token"], {})[gw["telegram_chat_id"]] = (
-            lambda text, gw=gw: handle_send_command(gw, text)
+            lambda text, gw=gw: handle_command(gw, text)
         )
     for token, handlers in by_token.items():
         label = ",".join(gw["name"] for gw in config.BOTS if gw["telegram_bot_token"] == token)

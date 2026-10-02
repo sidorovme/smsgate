@@ -58,6 +58,7 @@ for gw in _raw["gateways"]:
     entry["send_topic"] = gw.get("send_topic") or mqtt_topic.replace("/incoming/", "/send/")
     entry["availability_topic"] = availability_topic
     entry["status_topic"] = status_topic
+    entry["cmd_topic"] = gw.get("cmd_topic") or mqtt_topic.replace("/incoming/", "/cmd/")
     GATEWAYS[mqtt_topic] = entry
     STATUS_TOPICS[status_topic] = entry
     SEND_RESULT_TOPICS[
