@@ -44,6 +44,24 @@ def init():
             received_at     REAL    NOT NULL,
             sent_to_telegram INTEGER NOT NULL DEFAULT 0
         );
+
+        CREATE TABLE IF NOT EXISTS sent_messages (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            gateway     TEXT    NOT NULL,
+            recipient   TEXT    NOT NULL,
+            text        TEXT    NOT NULL,
+            parts_total INTEGER NOT NULL,
+            state       TEXT    NOT NULL DEFAULT 'pending',  -- pending|sent|failed|delivered|undelivered
+            created_at  REAL    NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS sent_parts (
+            msg_id   INTEGER NOT NULL REFERENCES sent_messages(id) ON DELETE CASCADE,
+            part_no  INTEGER NOT NULL,
+            mr       INTEGER,                                 -- message reference от модема (+CMGS)
+            state    TEXT    NOT NULL DEFAULT 'pending',      -- pending|sent|delivered|failed
+            PRIMARY KEY (msg_id, part_no)
+        );
     """)
     conn.commit()
     conn.close()
@@ -161,3 +179,121 @@ def cleanup_stale():
 
     if deleted > 0:
         log.info("Cleaned up %d stale multipart parts", deleted)
+
+
+# ── Outgoing SMS ─────────────────────────────────────
+
+def create_sent(gateway: str, recipient: str, text: str, parts_total: int) -> int:
+    """Register an outgoing message (state=pending). Returns its id."""
+    conn = _connect()
+    cur = conn.execute(
+        """INSERT INTO sent_messages (gateway, recipient, text, parts_total, created_at)
+           VALUES (?, ?, ?, ?, ?)""",
+        (gateway, recipient, text, parts_total, time.time()),
+    )
+    msg_id = cur.lastrowid
+    conn.executemany(
+        "INSERT INTO sent_parts (msg_id, part_no) VALUES (?, ?)",
+        [(msg_id, n) for n in range(1, parts_total + 1)],
+    )
+    conn.commit()
+    conn.close()
+    return msg_id
+
+
+def is_pending(msg_id: int) -> bool:
+    conn = _connect()
+    row = conn.execute("SELECT state FROM sent_messages WHERE id = ?", (msg_id,)).fetchone()
+    conn.close()
+    return row is not None and row["state"] == "pending"
+
+
+def fail_pending(msg_id: int):
+    """Mark a still-pending message as failed (no response from the gateway)."""
+    conn = _connect()
+    conn.execute(
+        "UPDATE sent_messages SET state = 'failed' WHERE id = ? AND state = 'pending'",
+        (msg_id,),
+    )
+    conn.execute(
+        "UPDATE sent_parts SET state = 'failed' WHERE msg_id = ? AND state = 'pending'",
+        (msg_id,),
+    )
+    conn.commit()
+    conn.close()
+
+
+def apply_send_result(msg_id: int, ok: bool, refs: list):
+    """
+    Apply the gateway's send result. refs — message references (+CMGS) of the parts
+    the modem accepted, in order. Returns the message row, or None if unknown/already handled.
+    """
+    conn = _connect()
+    msg = conn.execute(
+        "SELECT * FROM sent_messages WHERE id = ? AND state = 'pending'", (msg_id,)
+    ).fetchone()
+    if msg is None:
+        conn.close()
+        return None
+
+    for n, mr in enumerate(refs, start=1):
+        conn.execute(
+            "UPDATE sent_parts SET mr = ?, state = 'sent' WHERE msg_id = ? AND part_no = ?",
+            (mr, msg_id, n),
+        )
+    conn.execute(
+        "UPDATE sent_parts SET state = 'failed' WHERE msg_id = ? AND state = 'pending'",
+        (msg_id,),
+    )
+    conn.execute(
+        "UPDATE sent_messages SET state = ? WHERE id = ?",
+        ("sent" if ok else "failed", msg_id),
+    )
+    conn.commit()
+    conn.close()
+    return msg
+
+
+def apply_delivery_report(gateway: str, mr: int, recipient: str, state: str):
+    """
+    Match a delivery report to a sent part and update it.
+    state: delivered | failed (temporary 'pending' reports must be filtered by the caller).
+    Returns (message_row, final_state) when the whole message just reached a final
+    state ('delivered' or 'undelivered'), otherwise None.
+    """
+    tail = "".join(c for c in recipient if c.isdigit())[-9:]
+    conn = _connect()
+    cutoff = time.time() - 3 * 86400
+    rows = conn.execute(
+        """SELECT m.*, p.part_no FROM sent_parts p
+           JOIN sent_messages m ON m.id = p.msg_id
+           WHERE m.gateway = ? AND m.state = 'sent' AND p.mr = ? AND p.state = 'sent'
+             AND m.created_at > ?
+           ORDER BY m.created_at DESC""",
+        (gateway, mr, cutoff),
+    ).fetchall()
+
+    target = next(
+        (r for r in rows
+         if "".join(c for c in r["recipient"] if c.isdigit())[-9:] == tail),
+        None,
+    )
+    if target is None:
+        conn.close()
+        return None
+
+    conn.execute(
+        "UPDATE sent_parts SET state = ? WHERE msg_id = ? AND part_no = ?",
+        (state, target["id"], target["part_no"]),
+    )
+    states = [
+        r["state"]
+        for r in conn.execute("SELECT state FROM sent_parts WHERE msg_id = ?", (target["id"],))
+    ]
+    final = None
+    if all(s in ("delivered", "failed") for s in states):
+        final = "delivered" if all(s == "delivered" for s in states) else "undelivered"
+        conn.execute("UPDATE sent_messages SET state = ? WHERE id = ?", (final, target["id"]))
+    conn.commit()
+    conn.close()
+    return (target, final) if final else None

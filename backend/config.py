@@ -41,6 +41,9 @@ MULTIPART_TIMEOUT_SEC = _raw.get("multipart_timeout_sec", 300)
 GATEWAYS = {}
 AVAILABILITY_TOPICS = {}
 STATUS_TOPICS = {}  # sms/status/<x> — метрики устройства, в т.ч. состояние сотовой сети
+SEND_RESULT_TOPICS = {}  # sms/send-result/<x> — результат отправки SMS шлюзом
+REPORT_TOPICS = {}       # sms/report/<x> — отчёты о доставке (SMS-STATUS-REPORT, PDU)
+BOTS = []                # по одному на шлюз: для приёма команд /send из Telegram
 for gw in _raw["gateways"]:
     entry = {
         "name": gw["name"],
@@ -52,6 +55,19 @@ for gw in _raw["gateways"]:
         mqtt_topic.replace("/incoming/", "/status/") + "/availability"
     )
     status_topic = gw.get("status_topic") or mqtt_topic.replace("/incoming/", "/status/")
+    entry["send_topic"] = gw.get("send_topic") or mqtt_topic.replace("/incoming/", "/send/")
+    entry["availability_topic"] = availability_topic
+    entry["status_topic"] = status_topic
     GATEWAYS[mqtt_topic] = entry
     STATUS_TOPICS[status_topic] = entry
+    SEND_RESULT_TOPICS[
+        gw.get("send_result_topic") or mqtt_topic.replace("/incoming/", "/send-result/")
+    ] = entry
+    REPORT_TOPICS[gw.get("report_topic") or mqtt_topic.replace("/incoming/", "/report/")] = entry
+    BOTS.append(entry)
     AVAILABILITY_TOPICS[availability_topic] = entry
+
+# ── Outgoing SMS limits ───────────────────────────────
+SEND_MAX_PARTS = _raw.get("send_max_parts", 6)             # максимум частей в одном сообщении
+SEND_RATE_LIMIT_PER_MIN = _raw.get("send_rate_limit_per_min", 5)  # на шлюз
+SEND_RESULT_TIMEOUT_SEC = _raw.get("send_result_timeout_sec", 120)

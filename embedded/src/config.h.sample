@@ -11,6 +11,9 @@
 #define MQTT_STATUS_TOPIC       "sms/status"               // метрики устройства (retained)
 #define MQTT_AVAILABILITY_TOPIC "sms/status/availability"  // online/offline (LWT, retained)
 #define MQTT_CMD_TOPIC          "sms/cmd"                  // команды: reboot, reset-modem, status
+#define MQTT_SEND_TOPIC         "sms/send"          // команды на отправку SMS (JSON с PDU)
+#define MQTT_SEND_RESULT_TOPIC  "sms/send-result"   // результат отправки
+#define MQTT_REPORT_TOPIC       "sms/report"        // отчёты о доставке (PDU)
 #define DEVICE_ID      "gate-1"
 
 // ── SIM900 UART ────────────────────────────────────────

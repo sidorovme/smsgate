@@ -3,6 +3,7 @@
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <esp_task_wdt.h>
+#include <vector>
 #include "config.h"
 #include "display.h"
 
@@ -12,6 +13,7 @@ WiFiClient wifiClient;
 PubSubClient mqtt(wifiClient);
 
 uint32_t smsForwarded  = 0;
+uint32_t smsSent       = 0;
 uint32_t smsPending    = 0;
 String   lastError     = "";
 bool     sim900Ok      = false;
@@ -36,8 +38,23 @@ uint32_t lastNetMs     = 0;
 enum PendingCmd { CMD_NONE, CMD_REBOOT, CMD_RESET_MODEM };
 volatile PendingCmd pendingCmd = CMD_NONE;
 
+// Очередь заданий на отправку SMS из MQTT. Тяжёлая работа (AT+CMGS, до минуты)
+// выполняется в loop(), callback только разбирает JSON и кладёт задание в очередь.
+struct SendPart { String pdu; int len; };
+struct SendJob {
+    long id = 0;
+    String error;                 // если не пусто — задание отклонено сразу
+    std::vector<SendPart> parts;
+};
+std::vector<SendJob> sendQueue;
+const size_t SEND_QUEUE_MAX = 4;
+long recentSendIds[8] = {0};      // дедупликация повторной доставки MQTT (QoS 1)
+uint8_t recentSendPos = 0;
+bool expectCdsPdu = false;        // после "+CDS: <len>" следующая строка — PDU отчёта
+
 // ── Предварительные объявления ─────────────────────────
 void publishStatus();
+void handleSimLine(const String& line);
 
 // ── Утилиты AT-команд ──────────────────────────────────
 
@@ -128,7 +145,7 @@ bool initSIM900() {
 
     sendATok("ATE0");              // отключить эхо
     sendATok("AT+CMGF=0");        // PDU режим
-    sendATok("AT+CNMI=2,1,0,0,0"); // уведомление +CMTI при новой SMS
+    sendATok("AT+CNMI=2,1,0,1,0"); // +CMTI при новой SMS, +CDS (отчёт о доставке) напрямую
 
     Serial.println("[SIM] Ready");
     return true;
@@ -150,7 +167,8 @@ void ensureMQTT() {
         Serial.println("[MQTT] Connected");
         mqtt.publish(MQTT_AVAILABILITY_TOPIC, "online", true); // birth-сообщение
         mqtt.subscribe(MQTT_CMD_TOPIC);
-        Serial.printf("[MQTT] Subscribed to %s\n", MQTT_CMD_TOPIC);
+        mqtt.subscribe(MQTT_SEND_TOPIC, 1);
+        Serial.printf("[MQTT] Subscribed to %s, %s\n", MQTT_CMD_TOPIC, MQTT_SEND_TOPIC);
         publishStatus();
     } else {
         Serial.printf("[MQTT] Failed, rc=%d\n", mqtt.state());
@@ -254,24 +272,48 @@ bool readAndForward(int index) {
 
 // ── Обработка входящих данных от SIM900 ────────────────
 
+// Обработка одной строки от модема (URC): +CMTI — новая SMS, +CDS — отчёт о доставке.
+void handleSimLine(const String& line) {
+    Serial.printf("[SIM] >> %s\n", line.c_str());
+
+    // +CMTI: "SM",3  — новая SMS на SIM с индексом 3
+    if (line.startsWith("+CMTI:")) {
+        int comma = line.indexOf(',');
+        if (comma != -1) {
+            int index = line.substring(comma + 1).toInt();
+            Serial.printf("[SMS] New SMS at index %d\n", index);
+            readAndForward(index);
+        }
+        return;
+    }
+
+    // +CDS: <len>\r\n<pdu> — отчёт о доставке (ds=1 в CNMI)
+    if (line.startsWith("+CDS:")) {
+        expectCdsPdu = true;
+        return;
+    }
+    if (expectCdsPdu && line.length() >= 10) {
+        expectCdsPdu = false;
+        if (!mqtt.connected()) {
+            Serial.println("[CDS] MQTT disconnected, delivery report lost");
+            return;
+        }
+        JsonDocument doc;
+        doc["pdu"]       = line;
+        doc["device_id"] = DEVICE_ID;
+        String body;
+        serializeJson(doc, body);
+        mqtt.publish(MQTT_REPORT_TOPIC, body.c_str());
+        Serial.println("[CDS] Delivery report forwarded");
+    }
+}
+
 void processSIMData() {
     while (simSerial.available()) {
         char c = simSerial.read();
         if (c == '\n') {
             simBuffer.trim();
-            if (simBuffer.length() > 0) {
-                Serial.printf("[SIM] >> %s\n", simBuffer.c_str());
-
-                // +CMTI: "SM",3  — новая SMS на SIM с индексом 3
-                if (simBuffer.startsWith("+CMTI:")) {
-                    int comma = simBuffer.indexOf(',');
-                    if (comma != -1) {
-                        int index = simBuffer.substring(comma + 1).toInt();
-                        Serial.printf("[SMS] New SMS at index %d\n", index);
-                        readAndForward(index);
-                    }
-                }
-            }
+            if (simBuffer.length() > 0) handleSimLine(simBuffer);
             simBuffer = "";
         } else if (c != '\r') {
             simBuffer += c;
@@ -359,6 +401,158 @@ bool updateNetwork() {
     return netStat != oldStat || netOperator != oldOp;
 }
 
+// ── Отправка SMS ───────────────────────────────────────
+
+// Ждёт в буфере buf подстроку(и) из условия, периодически кормит watchdog и MQTT.
+// Возвращает true, если условие выполнено до таймаута.
+template <typename Cond>
+bool waitModem(String& buf, uint32_t timeoutMs, Cond done) {
+    uint32_t start = millis();
+    while (millis() - start < timeoutMs) {
+        esp_task_wdt_reset();
+        while (simSerial.available()) buf += (char)simSerial.read();
+        if (done(buf)) return true;
+        mqtt.loop(); // keep-alive во время долгого ожидания
+        delay(10);
+    }
+    return false;
+}
+
+// Отправляет один PDU командой AT+CMGS. При успехе возвращает true и message reference.
+bool sendPdu(const SendPart& part, int& mr, String& err, String& extra) {
+    processSIMData();  // разобрать накопившиеся URC до начала диалога с модемом
+
+    String resp;
+    simSerial.printf("AT+CMGS=%d\r", part.len);
+    bool prompt = waitModem(resp, 5000, [](const String& b) {
+        return b.indexOf('>') != -1 || b.indexOf("ERROR") != -1;
+    });
+    if (!prompt || resp.indexOf('>') == -1) {
+        if (!prompt) simSerial.write(0x1B); // ESC — отмена ввода
+        err = prompt ? "modem rejected CMGS" : "no CMGS prompt";
+        extra += resp;
+        return false;
+    }
+
+    simSerial.print(part.pdu);
+    simSerial.write(0x1A); // Ctrl+Z
+
+    String result;
+    bool done = waitModem(result, 60000, [](const String& b) {
+        return (b.indexOf("+CMGS:") != -1 && b.indexOf("OK") != -1) || b.indexOf("ERROR") != -1;
+    });
+    Serial.printf("[SEND] CMGS → %s\n", result.c_str());
+    extra += resp + result;
+
+    int p = result.indexOf("+CMGS:");
+    if (done && p != -1) {
+        mr = result.substring(p + 6).toInt();
+        return true;
+    }
+
+    int e = result.indexOf("ERROR");
+    if (e != -1) {
+        int eol = result.indexOf('\r', e);
+        err = result.substring(result.lastIndexOf('+', e), eol == -1 ? result.length() : eol);
+        err.trim();
+    } else {
+        err = "send timeout";
+    }
+    return false;
+}
+
+void publishSendResult(long id, bool ok, const std::vector<int>& refs, const String& err) {
+    if (!mqtt.connected()) {
+        Serial.println("[SEND] MQTT disconnected, result not published");
+        return;
+    }
+    JsonDocument doc;
+    doc["id"]     = id;
+    doc["status"] = ok ? "ok" : "error";
+    JsonArray arr = doc["refs"].to<JsonArray>();
+    for (int r : refs) arr.add(r);
+    if (!ok) doc["error"] = err;
+
+    String body;
+    serializeJson(doc, body);
+    mqtt.publish(MQTT_SEND_RESULT_TOPIC, body.c_str());
+}
+
+void processSendJob(const SendJob& job) {
+    Serial.printf("[SEND] Job %ld: %u part(s)\n", job.id, (unsigned)job.parts.size());
+
+    std::vector<int> refs;
+    String err = job.error;
+
+    if (err.length() == 0) {
+        if (!sim900Ok) err = "modem not ready";
+        else if (netStat != 1 && netStat != 5) err = "no network";
+    }
+
+    String extra;
+    if (err.length() == 0) {
+        for (const SendPart& part : job.parts) {
+            int mr = -1;
+            if (!sendPdu(part, mr, err, extra)) break;
+            refs.push_back(mr);
+            smsSent++;
+        }
+    }
+
+    bool ok = err.length() == 0;
+    if (!ok) {
+        lastError = "SMS send: " + err;
+        Serial.printf("[SEND] Job %ld FAILED: %s\n", job.id, err.c_str());
+    }
+    publishSendResult(job.id, ok, refs, err);
+
+    // URC, пришедшие во время диалога (+CMTI, +CDS), не теряем
+    int from = 0;
+    while (from < (int)extra.length()) {
+        int nl = extra.indexOf('\n', from);
+        if (nl == -1) nl = extra.length();
+        String line = extra.substring(from, nl);
+        line.trim();
+        from = nl + 1;
+        if (line.length() == 0 || line == "OK" || line == ">" || line.startsWith("+CMGS:") ||
+            line.indexOf("ERROR") != -1) continue;
+        handleSimLine(line);
+    }
+    publishStatus();
+}
+
+// Разбор JSON-задания из MQTT: {"id":N,"to":"...","parts":[{"pdu":"..","len":N},...]}
+void enqueueSend(const byte* payload, unsigned int length) {
+    JsonDocument doc;
+    if (deserializeJson(doc, payload, length)) {
+        Serial.println("[SEND] Bad JSON in send command");
+        return;
+    }
+    SendJob job;
+    job.id = doc["id"] | 0L;
+    if (job.id == 0) return;
+
+    for (long seen : recentSendIds) {
+        if (seen == job.id) {
+            Serial.printf("[SEND] Duplicate job %ld ignored\n", job.id);
+            return;
+        }
+    }
+    recentSendIds[recentSendPos++ % 8] = job.id;
+
+    for (JsonObject p : doc["parts"].as<JsonArray>()) {
+        SendPart part;
+        part.pdu = p["pdu"].as<String>();
+        part.len = p["len"] | 0;
+        if (part.pdu.length() == 0 || part.len <= 0) { job.error = "bad part"; break; }
+        job.parts.push_back(part);
+    }
+    if (job.parts.empty() && job.error.length() == 0) job.error = "no parts";
+    if (sendQueue.size() >= SEND_QUEUE_MAX) job.error = "send queue full";
+
+    sendQueue.push_back(job);
+}
+
 // ── Статус и команды через MQTT ────────────────────────
 
 // Публикует метрики устройства в MQTT_STATUS_TOPIC (retained).
@@ -370,6 +564,7 @@ void publishStatus() {
     doc["wifi_rssi"]     = WiFi.RSSI();
     doc["wifi_ip"]       = WiFi.localIP().toString();
     doc["sms_forwarded"] = smsForwarded;
+    doc["sms_sent"]      = smsSent;
     doc["sms_pending"]   = smsPending;
     doc["last_error"]    = lastError;
     doc["free_heap"]     = ESP.getFreeHeap();
@@ -430,6 +625,11 @@ void resetModem() {
 // Callback входящих MQTT-сообщений на MQTT_CMD_TOPIC.
 // Только помечает команду; выполнение — в loop().
 void onMqttMessage(char* topic, byte* payload, unsigned int length) {
+    if (strcmp(topic, MQTT_SEND_TOPIC) == 0) {
+        enqueueSend(payload, length);
+        return;
+    }
+
     String cmd;
     cmd.reserve(length);
     for (unsigned int i = 0; i < length; i++) cmd += (char)payload[i];
@@ -471,7 +671,7 @@ void setup() {
 
     // MQTT
     mqtt.setServer(MQTT_BROKER, MQTT_PORT);
-    mqtt.setBufferSize(1024);
+    mqtt.setBufferSize(4096); // PDU входящих + задания на отправку до нескольких частей
     mqtt.setCallback(onMqttMessage);
     ensureMQTT();
     displayBoot("MQTT", mqtt.connected());
@@ -517,6 +717,13 @@ void loop() {
     } else if (pendingCmd == CMD_RESET_MODEM) {
         pendingCmd = CMD_NONE;
         resetModem();
+    }
+
+    // Задания на отправку SMS (по одному за итерацию)
+    if (!sendQueue.empty()) {
+        SendJob job = sendQueue.front();
+        sendQueue.erase(sendQueue.begin());
+        processSendJob(job);
     }
 
     // Периодический опрос неотправленных SMS

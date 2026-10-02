@@ -3,6 +3,7 @@ Telegram Bot API integration — send SMS notifications.
 """
 
 import logging
+import time
 
 import requests
 
@@ -11,6 +12,9 @@ log = logging.getLogger(__name__)
 
 def _escape_html(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+escape_html = _escape_html
 
 
 def _post(bot_token: str, chat_id: str, message: str) -> bool:
@@ -100,3 +104,53 @@ def send_network(
         log.info("Telegram alert: %s network registered=%s operator=%s", name, registered, operator)
         return True
     return False
+
+
+def send_text(message: str, bot_token: str, chat_id: str) -> bool:
+    """Send a ready HTML message (callers escape user-provided parts)."""
+    return _post(bot_token, chat_id, message)
+
+
+def _get_updates(bot_token: str, offset, timeout: int):
+    resp = requests.get(
+        f"https://api.telegram.org/bot{bot_token}/getUpdates",
+        params={"offset": offset, "timeout": timeout, "allowed_updates": '["message"]'},
+        timeout=timeout + 10,
+    )
+    resp.raise_for_status()
+    return resp.json().get("result", [])
+
+
+def poll_commands(name: str, bot_token: str, chat_id: str, handler, is_running):
+    """
+    Long-poll a bot and call handler(text) for each text message from the authorized chat.
+    Messages from other chats are ignored. Backlog accumulated while the backend was down
+    is discarded, so a stale /send is never executed late.
+    """
+    offset = None
+    try:
+        backlog = _get_updates(bot_token, -1, 0)
+        if backlog:
+            offset = backlog[-1]["update_id"] + 1
+    except Exception:
+        log.exception("[%s] Telegram: failed to skip backlog", name)
+
+    while is_running():
+        try:
+            for upd in _get_updates(bot_token, offset, 30):
+                offset = upd["update_id"] + 1
+                msg = upd.get("message")
+                if not msg or "text" not in msg:
+                    continue
+                if str(msg["chat"]["id"]) != chat_id:
+                    log.warning("[%s] Telegram: ignoring message from chat %s", name, msg["chat"]["id"])
+                    continue
+                if time.time() - msg.get("date", 0) > 120:
+                    continue  # устаревшая команда
+                try:
+                    handler(msg["text"])
+                except Exception:
+                    log.exception("[%s] Telegram command handler failed", name)
+        except Exception:
+            log.exception("[%s] Telegram polling error", name)
+            time.sleep(5)

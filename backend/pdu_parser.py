@@ -221,3 +221,53 @@ def parse(pdu_hex: str) -> dict:
         "timestamp": timestamp,
         "multipart": multipart,
     }
+
+
+def parse_status_report(pdu_hex: str) -> dict:
+    """
+    Parse SMS-STATUS-REPORT PDU (delivery report from the SMSC).
+
+    Returns:
+        {
+            "reference": int,        # TP-MR of the submitted message (as reported by modem)
+            "recipient": "+...",
+            "status": int,           # TP-ST
+            "state": "delivered" | "pending" | "failed",
+        }
+    """
+    data = _hex_to_bytes(pdu_hex)
+    pos = 1 + data[0]  # SMSC
+
+    pos += 1  # first octet (SMS-STATUS-REPORT)
+    reference = data[pos]
+    pos += 1
+
+    ra_len = data[pos]
+    ra_type = data[pos + 1]
+    pos += 2
+    ra_count = (ra_len + 1) // 2
+    ra_data = data[pos : pos + ra_count]
+    pos += ra_count
+    recipient = _decode_semi_octet(ra_data)
+    if (ra_type & 0x70) == 0x10:
+        recipient = "+" + recipient
+
+    pos += 7  # TP-SCTS
+    pos += 7  # TP-DT
+    status = data[pos]
+
+    # 3GPP 23.040 9.2.3.15: 0x00-0x1F — доставлено/принято, 0x20-0x3F — временная
+    # ошибка, SC ещё пытается; 0x40-0x7F — окончательная ошибка (SC больше не пытается).
+    if status < 0x20:
+        state = "delivered"
+    elif status < 0x40:
+        state = "pending"
+    else:
+        state = "failed"
+
+    return {
+        "reference": reference,
+        "recipient": recipient,
+        "status": status,
+        "state": state,
+    }

@@ -5,9 +5,16 @@ mqtt:
 db_path: "sms.db"
 multipart_timeout_sec: 300
 
+# Отправка SMS (команда /send в Telegram-чате шлюза)
+send_max_parts: 6              # максимум частей в одном сообщении
+send_rate_limit_per_min: 5     # максимум отправок в минуту на шлюз
+send_result_timeout_sec: 120   # сколько ждать ответа шлюза
+
 # availability_topic — топик keep-alive/LWT шлюза (online/offline).
 # По умолчанию выводится из mqtt_topic: sms/incoming/<x> → sms/status/<x>/availability.
 # Задавайте явно, только если топик в прошивке отличается от этой схемы.
+# Топики отправки выводятся из mqtt_topic: sms/incoming/<x> → sms/send/<x>,
+# sms/send-result/<x>, sms/report/<x> (можно задать явно: send_topic, send_result_topic, report_topic).
 gateways:
   - name: "gate-1"
     mqtt_topic: "sms/incoming/gate-1"

@@ -5,15 +5,18 @@ Listens to MQTT, parses PDU, assembles multipart, sends to Telegram.
 
 import json
 import logging
+import random
 import signal
 import sys
 import threading
 import time
+from collections import defaultdict, deque
 
 import paho.mqtt.client as mqtt
 
 import config
 import db
+import pdu_encoder
 import pdu_parser
 import telegram
 
@@ -32,6 +35,13 @@ _availability = {}
 # Последнее известное состояние сотовой сети по status-топику: (registered, operator)
 _network = {}
 
+_client = None  # MQTT-клиент, нужен обработчикам Telegram-команд для публикации
+_send_times = defaultdict(deque)  # gateway name -> времена последних отправок (rate limit)
+_send_lock = threading.Lock()
+_ref_counter = random.randint(1, 255)  # TP-reference для UDH (multipart)
+
+USAGE = "Использование: <code>/send +375291234567 Текст сообщения</code>"
+
 
 def on_connect(client, userdata, flags, reason_code, properties):
     if reason_code == 0:
@@ -41,7 +51,11 @@ def on_connect(client, userdata, flags, reason_code, properties):
         for topic in config.AVAILABILITY_TOPICS:
             log.info("MQTT subscribing to %s", topic)
             client.subscribe(topic)
-        for topic in config.STATUS_TOPICS:
+        for topic in (
+            list(config.STATUS_TOPICS)
+            + list(config.SEND_RESULT_TOPICS)
+            + list(config.REPORT_TOPICS)
+        ):
             log.info("MQTT subscribing to %s", topic)
             client.subscribe(topic)
     else:
@@ -119,12 +133,161 @@ def handle_status(topic, msg):
     )
 
 
+# ── Outgoing SMS ──────────────────────────────────────
+
+def _reply(gateway, message):
+    telegram.send_text(message, gateway["telegram_bot_token"], gateway["telegram_chat_id"])
+
+
+def _next_reference():
+    global _ref_counter
+    with _send_lock:
+        _ref_counter = _ref_counter % 255 + 1
+        return _ref_counter
+
+
+def _rate_limited(gateway):
+    now = time.time()
+    with _send_lock:
+        times = _send_times[gateway["name"]]
+        while times and now - times[0] > 60:
+            times.popleft()
+        if len(times) >= config.SEND_RATE_LIMIT_PER_MIN:
+            return True
+        times.append(now)
+        return False
+
+
+def handle_send_command(gateway, text):
+    """Handle '/send <number> <text>' from the gateway's authorized Telegram chat."""
+    parts = text.strip().split(None, 2)
+    if not parts or parts[0].split("@")[0].lower() != "/send":
+        return
+    if len(parts) < 3:
+        _reply(gateway, USAGE)
+        return
+
+    try:
+        number = pdu_encoder.normalize_number(parts[1])
+        pdus = pdu_encoder.encode(number, parts[2], _next_reference())
+    except pdu_encoder.EncodeError as e:
+        _reply(gateway, f"❌ {telegram.escape_html(str(e))}\n{USAGE}")
+        return
+
+    name = telegram.escape_html(gateway["name"])
+    if len(pdus) > config.SEND_MAX_PARTS:
+        _reply(gateway, f"❌ Слишком длинное сообщение: {len(pdus)} частей "
+                        f"(максимум {config.SEND_MAX_PARTS})")
+        return
+
+    # Шлюз офлайн / SIM не в сети — отклоняем сразу, пользователь повторит позже
+    if _availability.get(gateway["availability_topic"]) != "online":
+        _reply(gateway, f"❌ <b>{name}</b> недоступен (offline), SMS не отправлено. Повторите позже.")
+        return
+    net = _network.get(gateway["status_topic"])
+    if net is not None and not net[0]:
+        _reply(gateway, f"❌ SIM-карта <b>{name}</b> не в сети, SMS не отправлено. Повторите позже.")
+        return
+
+    if _rate_limited(gateway):
+        _reply(gateway, f"❌ Превышен лимит: не более {config.SEND_RATE_LIMIT_PER_MIN} SMS в минуту")
+        return
+
+    msg_id = db.create_sent(gateway["name"], number, parts[2], len(pdus))
+    payload = {
+        "id": msg_id,
+        "to": number,
+        "parts": [{"pdu": pdu, "len": length} for pdu, length in pdus],
+    }
+    info = _client.publish(gateway["send_topic"], json.dumps(payload), qos=1)
+    if info.rc != mqtt.MQTT_ERR_SUCCESS:
+        db.fail_pending(msg_id)
+        _reply(gateway, "❌ Не удалось передать команду шлюзу (MQTT). Повторите позже.")
+        return
+
+    log.info("Send #%d to %s via %s (%d parts)", msg_id, number, gateway["name"], len(pdus))
+    _reply(gateway, f"⏳ Отправляю на <b>{telegram.escape_html(number)}</b>"
+                    + (f" ({len(pdus)} ч.)" if len(pdus) > 1 else ""))
+
+    def on_timeout():
+        if db.is_pending(msg_id):
+            db.fail_pending(msg_id)
+            log.warning("Send #%d: no result from gateway", msg_id)
+            _reply(gateway, f"❌ Нет ответа от шлюза <b>{name}</b>, статус отправки на "
+                            f"{telegram.escape_html(number)} неизвестен.")
+
+    timer = threading.Timer(config.SEND_RESULT_TIMEOUT_SEC, on_timeout)
+    timer.daemon = True
+    timer.start()
+
+
+def handle_send_result(topic, msg):
+    """Gateway reports the outcome of a send job."""
+    gateway = config.SEND_RESULT_TOPICS.get(topic)
+    if gateway is None:
+        return
+
+    result = json.loads(msg.payload.decode())
+    msg_id = int(result["id"])
+    ok = result.get("status") == "ok"
+    refs = [int(r) for r in result.get("refs", [])]
+
+    row = db.apply_send_result(msg_id, ok, refs)
+    if row is None:
+        log.info("Send result for unknown/finished #%s ignored", msg_id)
+        return
+
+    to = telegram.escape_html(row["recipient"])
+    log.info("Send #%d result: %s %s", msg_id, result.get("status"), result.get("error", ""))
+    if ok:
+        _reply(gateway, f"📤 Отправлено на <b>{to}</b>, жду отчёт о доставке")
+    else:
+        error = telegram.escape_html(str(result.get("error", "неизвестная ошибка")))
+        extra = f" (отправлено частей: {len(refs)} из {row['parts_total']})" if refs else ""
+        _reply(gateway, f"❌ Не отправлено на <b>{to}</b>: {error}{extra}")
+
+
+def handle_report(topic, msg):
+    """Delivery report (SMS-STATUS-REPORT) forwarded by the gateway."""
+    gateway = config.REPORT_TOPICS.get(topic)
+    if gateway is None:
+        return
+
+    payload = json.loads(msg.payload.decode())
+    report = pdu_parser.parse_status_report(payload.get("pdu", ""))
+    log.info("Delivery report from %s: %s", gateway["name"], report)
+
+    if report["state"] == "pending":
+        return  # временная ошибка, оператор ещё пытается — дождёмся финального отчёта
+
+    outcome = db.apply_delivery_report(
+        gateway["name"], report["reference"], report["recipient"], report["state"]
+    )
+    if outcome is None:
+        return
+
+    row, final = outcome
+    to = telegram.escape_html(row["recipient"])
+    if final == "delivered":
+        _reply(gateway, f"✅ Доставлено: <b>{to}</b>")
+    else:
+        _reply(gateway, f"⚠️ Не доставлено: <b>{to}</b> (код оператора 0x{report['status']:02X})")
+
+
 def on_message(client, userdata, msg):
     try:
         topic = msg.topic
 
         if topic in config.STATUS_TOPICS:
             handle_status(topic, msg)
+            return
+
+        if topic in config.SEND_RESULT_TOPICS:
+            handle_send_result(topic, msg)
+            return
+
+        if topic in config.REPORT_TOPICS:
+            handle_report(topic, msg)
             return
 
         if topic in config.AVAILABILITY_TOPICS:
@@ -192,7 +355,7 @@ def cleanup_loop():
 
 
 def main():
-    global running
+    global running, _client
 
     log.info("=== SMS Gateway Backend starting ===")
 
@@ -207,11 +370,27 @@ def main():
     client.on_connect = on_connect
     client.on_message = on_message
 
+    _client = client
+
     client.connect(config.MQTT_BROKER, config.MQTT_PORT, keepalive=60)
 
     # Cleanup thread
     cleanup_thread = threading.Thread(target=cleanup_loop, daemon=True)
     cleanup_thread.start()
+
+    # Telegram: приём команд /send (по потоку на бота)
+    for gw in config.BOTS:
+        threading.Thread(
+            target=telegram.poll_commands,
+            args=(
+                gw["name"],
+                gw["telegram_bot_token"],
+                gw["telegram_chat_id"],
+                lambda text, gw=gw: handle_send_command(gw, text),
+                lambda: running,
+            ),
+            daemon=True,
+        ).start()
 
     # Graceful shutdown
     def shutdown(signum, frame):
