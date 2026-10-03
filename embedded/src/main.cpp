@@ -70,6 +70,7 @@ std::vector<FwdJob> fwdQueue;
 const size_t FWD_QUEUE_MAX = 2;
 long recentFwdIds[8] = {0};
 uint8_t recentFwdPos = 0;
+bool diagDone = false;           // разовая диагностика запретов вызовов выполнена
 bool expectCdsPdu = false;        // после "+CDS: <len>" следующая строка — PDU отчёта
 
 // ── Диагностика в MQTT ─────────────────────────────────
@@ -763,7 +764,7 @@ void enqueueUssd(const byte* payload, unsigned int length) {
 // ── Переадресация звонков (AT+CCFC) ────────────────────
 
 // AT-команда с долгим ожиданием (сеть отвечает до ~30 с), без потери keep-alive MQTT.
-String atWait(const String& cmd, uint32_t timeoutMs, bool& ok) {
+String atWait(const String& cmd, uint32_t timeoutMs, bool& ok, const char* tag = "FWD") {
     processSIMData();
     simSerial.println(cmd);
     String buf;
@@ -772,7 +773,7 @@ String atWait(const String& cmd, uint32_t timeoutMs, bool& ok) {
     });
     ok = buf.indexOf("OK") != -1 && buf.indexOf("ERROR") == -1;
     Serial.printf("[FWD] %s → %s\n", cmd.c_str(), buf.c_str());
-    dbg("FWD %s -> %s", cmd.c_str(), oneLine(buf).c_str());
+    dbg("%s %s -> %s", tag, cmd.c_str(), oneLine(buf).c_str());
     return buf;
 }
 
@@ -823,9 +824,10 @@ void processFwdJob(const FwdJob& job) {
 
     bool ok = true;
     if (err.length() == 0 && job.action == "set") {
-        // 145 — международный формат (+), 129 — как есть
+        // 145 — международный формат ("+" оставляем: без него SIM900 отвечает
+        // "operation not allowed" ещё до обращения к сети), 129 — как есть.
         int type = job.number.startsWith("+") ? 145 : 129;
-        atWait("AT+CCFC=" + String(job.reason) + ",3,\"" + job.number + "\"," + String(type), 30000, ok);
+        atWait("AT+CCFC=" + String(job.reason) + ",3,\"" + job.number + "\"," + String(type) + ",1", 30000, ok);  // class 1 = только голос
         if (!ok) err = "forward set failed";
     } else if (err.length() == 0 && job.action == "off") {
         atWait("AT+CCFC=" + String(job.reason) + ",4", 30000, ok);  // mode 4 = стереть
@@ -851,6 +853,24 @@ void processFwdJob(const FwdJob& job) {
         serializeJson(doc, body);
         mqtt.publish(MQTT_FORWARD_RESULT_TOPIC, body.c_str());
     }
+}
+
+// Разовая диагностика голосовых ограничений: запреты вызовов (+CLCK) и состояние модема.
+// Результат — в debug-топик. Запрос запретов идёт в сеть, поэтому делается не при загрузке.
+void netDiag() {
+    const char* cmds[] = {
+        "AT+CGMR", "AT+CFUN?", "AT+CGREG?",
+        "AT+CLCK=\"AI\",2",  // запрет всех входящих
+        "AT+CLCK=\"IR\",2",  // запрет входящих в роуминге
+        "AT+CLCK=\"AO\",2",  // запрет всех исходящих
+        "AT+CLCK=\"OI\",2",  // запрет исходящих международных
+    };
+    for (const char* c : cmds) {
+        esp_task_wdt_reset();
+        bool ok;
+        atWait(c, 20000, ok, "DIAG");
+    }
+    dbg("DIAG done");
 }
 
 // {"id":N,"action":"query|set|off","number":"+..."}
@@ -1062,6 +1082,12 @@ void loop() {
         SendJob job = sendQueue.front();
         sendQueue.erase(sendQueue.begin());
         processSendJob(job);
+    }
+
+    // Разовая диагностика запретов вызовов (через 40 с после старта, когда всё поднялось)
+    if (!diagDone && sim900Ok && mqtt.connected() && millis() - startTime > 40000) {
+        diagDone = true;
+        netDiag();
     }
 
     // Переадресация звонков
