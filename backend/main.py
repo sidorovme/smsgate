@@ -46,6 +46,26 @@ _expected_offline = {}  # availability topic -> время команды reboot
 EXPECTED_REBOOT_SEC = 60
 
 USAGE = "Использование: <code>/send +375291234567 Текст сообщения</code>"
+_forward_pending = {}  # id -> (gateway name, action)
+FORWARD_REASONS = {0: "Все вызовы", 1: "Занято", 2: "Нет ответа", 3: "Недоступен"}
+# тип переадресации в команде → (reason для AT+CCFC, какие условия затрагивает)
+FORWARD_TYPES = {
+    "all": (0, [0]),
+    "busy": (1, [1]),
+    "noreply": (2, [2]),
+    "unreachable": (3, [3]),
+    "conditional": (5, [1, 2, 3]),  # занято + нет ответа + недоступен
+}
+FORWARD_USAGE = (
+    "<code>/forward</code> — состояние\n"
+    "<code>/forward all +995...</code> — все вызовы (безусловная)\n"
+    "<code>/forward busy +995...</code> — если занято\n"
+    "<code>/forward noreply +995...</code> — если не отвечает\n"
+    "<code>/forward unreachable +995...</code> — если недоступен\n"
+    "<code>/forward conditional +995...</code> — занято + нет ответа + недоступен\n"
+    "<code>/forward off</code> — выключить всё, <code>/forward off busy</code> — только один тип"
+)
+
 _ussd_pending = {}  # id -> gateway name (ждём ответ шлюза)
 _ussd_id = int(time.time()) % 1_000_000_000
 USSD_RE = re.compile(r"^[0-9*#+]{1,64}$")
@@ -53,6 +73,7 @@ USSD_RE = re.compile(r"^[0-9*#+]{1,64}$")
 HELP = (
     "/send <code>+375291234567 текст</code> — отправить SMS\n"
     "/ussd <code>*101#</code> — USSD-запрос (<code>/ussd cancel</code> закрывает сессию)\n"
+    "/forward — переадресация звонков, подробности: <code>/forward help</code>\n"
     "/status — состояние шлюза\n"
     "/reboot — перезагрузить шлюз\n"
     "/reset_modem — перезапустить модем"
@@ -73,6 +94,7 @@ def on_connect(client, userdata, flags, reason_code, properties):
             + list(config.REPORT_TOPICS)
             + list(config.DEBUG_TOPICS)
             + list(config.USSD_RESULT_TOPICS)
+            + list(config.FORWARD_RESULT_TOPICS)
         ):
             log.info("MQTT subscribing to %s", topic)
             client.subscribe(topic)
@@ -189,6 +211,8 @@ def handle_command(gateway, text):
         handle_send_command(gateway, parts)
     elif cmd == "/ussd":
         handle_ussd_command(gateway, parts[1] if len(parts) > 1 else "")
+    elif cmd == "/forward":
+        handle_forward_command(gateway, parts[1:])
     elif cmd == "/status":
         handle_status_command(gateway)
     elif cmd in ("/reboot", "/reset_modem", "/reset-modem"):
@@ -359,6 +383,110 @@ def handle_ussd_result(topic, msg):
     _reply(gateway, "📟 " + body)
 
 
+def handle_forward_command(gateway, args):
+    """Handle '/forward', '/forward <type> <number>', '/forward off [type]'."""
+    global _ussd_id
+    name = telegram.escape_html(gateway["name"])
+    args = [a.lower() if i == 0 else a for i, a in enumerate(args)]
+
+    if not args:
+        payload, action, affected = {"action": "query"}, "query", []
+    elif args[0] == "off":
+        ftype = args[1].lower() if len(args) > 1 else None
+        if ftype is None:
+            payload, affected = {"action": "off", "reason": 4}, [0, 1, 2, 3]
+        elif ftype in FORWARD_TYPES:
+            reason, affected = FORWARD_TYPES[ftype]
+            payload = {"action": "off", "reason": reason}
+        else:
+            _reply(gateway, FORWARD_USAGE)
+            return
+        action = "off"
+    elif args[0] in FORWARD_TYPES and len(args) == 2:
+        reason, affected = FORWARD_TYPES[args[0]]
+        try:
+            number = pdu_encoder.normalize_number(args[1])
+        except pdu_encoder.EncodeError:
+            _reply(gateway, "❌ Некорректный номер\n" + FORWARD_USAGE)
+            return
+        payload, action = {"action": "set", "reason": reason, "number": number}, "set"
+    else:
+        _reply(gateway, FORWARD_USAGE)
+        return
+
+    if _availability.get(gateway["availability_topic"]) != "online":
+        _reply(gateway, f"❌ <b>{name}</b> недоступен (offline). Повторите позже.")
+        return
+    net = _network.get(gateway["status_topic"])
+    if net is not None and not net[0]:
+        _reply(gateway, f"❌ SIM-карта <b>{name}</b> не в сети. Повторите позже.")
+        return
+    if _rate_limited(gateway):
+        _reply(gateway, f"❌ Превышен лимит: не более {config.SEND_RATE_LIMIT_PER_MIN} запросов в минуту")
+        return
+
+    with _send_lock:
+        _ussd_id += 1
+        req_id = _ussd_id
+    payload["id"] = req_id
+    info = _client.publish(gateway["forward_topic"], json.dumps(payload), qos=1)
+    if info.rc != mqtt.MQTT_ERR_SUCCESS:
+        _reply(gateway, "❌ Не удалось передать команду шлюзу (MQTT).")
+        return
+
+    log.info("Forward #%d %s via %s", req_id, action, gateway["name"])
+    _forward_pending[req_id] = (gateway["name"], action, affected)
+    _reply(gateway, "⏳ Запрашиваю у оператора (может занять до минуты)…")
+
+    def on_timeout():
+        if _forward_pending.pop(req_id, None) is not None:
+            _reply(gateway, f"❌ Нет ответа от <b>{name}</b> по переадресации. "
+                            "Проверьте состояние командой /forward.")
+
+    timer = threading.Timer(config.FORWARD_TIMEOUT_SEC, on_timeout)
+    timer.daemon = True
+    timer.start()
+
+
+def handle_forward_result(topic, msg):
+    gateway = config.FORWARD_RESULT_TOPICS.get(topic)
+    if gateway is None:
+        return
+
+    result = json.loads(msg.payload.decode())
+    pending = _forward_pending.pop(int(result["id"]), None)
+    if pending is None:
+        return
+    action, affected = pending[1], pending[2]
+
+    if result.get("status") != "ok":
+        error = telegram.escape_html(str(result.get("error", "неизвестная ошибка")))
+        _reply(gateway, f"❌ Переадресация: {error}")
+        return
+
+    forwards = {f["reason"]: f for f in result.get("forwards", [])}
+    lines = []
+    for reason, label in FORWARD_REASONS.items():
+        f = forwards.get(reason)
+        if f is None or "error" in f:
+            err = telegram.escape_html(str(f.get("error", "нет данных"))) if f else "нет данных"
+            lines.append(f"{label}: ? ({err})")
+        elif f.get("active"):
+            lines.append(f"{label}: → <b>{telegram.escape_html(f.get('number') or '?')}</b>")
+        else:
+            lines.append(f"{label}: выкл")
+
+    header = {"set": "✅ Переадресация включена", "off": "✅ Переадресация выключена"}.get(
+        action, "📞 Переадресация звонков"
+    )
+    # сверяем с тем, что реально сообщил оператор по затронутым условиям
+    if action == "set" and not all(forwards.get(r, {}).get("active") for r in affected):
+        header = "⚠️ Оператор не подтвердил переадресацию"
+    elif action == "off" and any(forwards.get(r, {}).get("active") for r in affected):
+        header = "⚠️ Переадресация осталась включённой"
+    _reply(gateway, f"{header} — <b>{telegram.escape_html(gateway['name'])}</b>\n" + "\n".join(lines))
+
+
 def handle_send_command(gateway, parts):
     """Handle '/send <number> <text>' (parts = text.split(None, 2))."""
     if len(parts) < 3:
@@ -478,6 +606,10 @@ def on_message(client, userdata, msg):
 
         if topic in config.STATUS_TOPICS:
             handle_status(topic, msg)
+            return
+
+        if topic in config.FORWARD_RESULT_TOPICS:
+            handle_forward_result(topic, msg)
             return
 
         if topic in config.USSD_RESULT_TOPICS:

@@ -60,6 +60,16 @@ std::vector<UssdJob> ussdQueue;
 const size_t USSD_QUEUE_MAX = 2;
 long recentUssdIds[8] = {0};
 uint8_t recentUssdPos = 0;
+struct FwdJob {
+    long id = 0;
+    String action;   // "query" | "set" | "off"
+    String number;
+    int reason = 0;  // 0 все, 1 занято, 2 нет ответа, 3 вне зоны, 4 все условия, 5 все условные
+};
+std::vector<FwdJob> fwdQueue;
+const size_t FWD_QUEUE_MAX = 2;
+long recentFwdIds[8] = {0};
+uint8_t recentFwdPos = 0;
 bool expectCdsPdu = false;        // после "+CDS: <len>" следующая строка — PDU отчёта
 
 // ── Диагностика в MQTT ─────────────────────────────────
@@ -226,6 +236,7 @@ void ensureMQTT() {
         mqtt.subscribe(MQTT_CMD_TOPIC);
         mqtt.subscribe(MQTT_SEND_TOPIC, 1);
         mqtt.subscribe(MQTT_USSD_TOPIC, 1);
+        mqtt.subscribe(MQTT_FORWARD_TOPIC, 1);
         flushDbg();
         dbg("MQTT connected, wifi_rssi=%d", WiFi.RSSI());
         Serial.printf("[MQTT] Subscribed to %s, %s\n", MQTT_CMD_TOPIC, MQTT_SEND_TOPIC);
@@ -749,6 +760,129 @@ void enqueueUssd(const byte* payload, unsigned int length) {
     ussdQueue.push_back(job);
 }
 
+// ── Переадресация звонков (AT+CCFC) ────────────────────
+
+// AT-команда с долгим ожиданием (сеть отвечает до ~30 с), без потери keep-alive MQTT.
+String atWait(const String& cmd, uint32_t timeoutMs, bool& ok) {
+    processSIMData();
+    simSerial.println(cmd);
+    String buf;
+    waitModem(buf, timeoutMs, [](const String& b) {
+        return b.indexOf("OK") != -1 || b.indexOf("ERROR") != -1;
+    });
+    ok = buf.indexOf("OK") != -1 && buf.indexOf("ERROR") == -1;
+    Serial.printf("[FWD] %s → %s\n", cmd.c_str(), buf.c_str());
+    dbg("FWD %s -> %s", cmd.c_str(), oneLine(buf).c_str());
+    return buf;
+}
+
+// Условия переадресации: 0 все вызовы, 1 занято, 2 нет ответа, 3 вне зоны.
+void queryForward(int reason, JsonArray& out) {
+    bool ok;
+    String r = atWait("AT+CCFC=" + String(reason) + ",2", 30000, ok);
+    JsonObject o = out.add<JsonObject>();
+    o["reason"] = reason;
+    if (!ok) {
+        int e = r.indexOf("ERROR");
+        String err = e == -1 ? String("timeout") : r.substring(r.lastIndexOf('+', e), r.indexOf('\r', e) == -1 ? r.length() : r.indexOf('\r', e));
+        err.trim();
+        o["error"] = err;
+        return;
+    }
+    // +CCFC: <status>,<class>[,"<number>",<type>] — по строке на класс; нас интересует голос (class & 1)
+    bool active = false;
+    String number = "";
+    int from = 0;
+    while (true) {
+        int p = r.indexOf("+CCFC:", from);
+        if (p == -1) break;
+        int eol = r.indexOf('\n', p);
+        if (eol == -1) eol = r.length();
+        String line = r.substring(p + 6, eol);
+        int status = line.toInt();
+        int comma = line.indexOf(',');
+        int cls = comma == -1 ? 1 : line.substring(comma + 1).toInt();
+        if (status == 1 && (cls & 1)) {
+            active = true;
+            int q1 = line.indexOf('"');
+            int q2 = q1 == -1 ? -1 : line.indexOf('"', q1 + 1);
+            if (q2 != -1) number = line.substring(q1 + 1, q2);
+        }
+        from = eol;
+    }
+    o["active"] = active;
+    if (active) o["number"] = number;
+}
+
+void processFwdJob(const FwdJob& job) {
+    Serial.printf("[FWD] Job %ld: %s %s\n", job.id, job.action.c_str(), job.number.c_str());
+
+    String err;
+    if (!sim900Ok) err = "modem not ready";
+    else if (netStat != 1 && netStat != 5) err = "no network";
+
+    bool ok = true;
+    if (err.length() == 0 && job.action == "set") {
+        // 145 — международный формат (+), 129 — как есть
+        int type = job.number.startsWith("+") ? 145 : 129;
+        atWait("AT+CCFC=" + String(job.reason) + ",3,\"" + job.number + "\"," + String(type), 30000, ok);
+        if (!ok) err = "forward set failed";
+    } else if (err.length() == 0 && job.action == "off") {
+        atWait("AT+CCFC=" + String(job.reason) + ",4", 30000, ok);  // mode 4 = стереть
+        if (!ok) err = "forward off failed";
+    }
+
+    JsonDocument doc;
+    doc["id"] = job.id;
+    if (err.length() > 0) {
+        doc["status"] = "error";
+        doc["error"]  = err;
+    } else {
+        doc["status"] = "ok";
+        JsonArray arr = doc["forwards"].to<JsonArray>();
+        for (int reason = 0; reason <= 3; reason++) {
+            esp_task_wdt_reset();
+            queryForward(reason, arr);
+        }
+    }
+
+    if (mqtt.connected()) {
+        String body;
+        serializeJson(doc, body);
+        mqtt.publish(MQTT_FORWARD_RESULT_TOPIC, body.c_str());
+    }
+}
+
+// {"id":N,"action":"query|set|off","number":"+..."}
+void enqueueFwd(const byte* payload, unsigned int length) {
+    JsonDocument doc;
+    if (deserializeJson(doc, payload, length)) return;
+
+    FwdJob job;
+    job.id = doc["id"] | 0L;
+    if (job.id == 0) return;
+    for (long seen : recentFwdIds) {
+        if (seen == job.id) return;
+    }
+    recentFwdIds[recentFwdPos++ % 8] = job.id;
+
+    job.action = doc["action"].as<String>();
+    job.number = doc["number"].as<String>();
+    job.reason = doc["reason"] | (job.action == "off" ? 4 : 0);
+    if (job.reason < 0 || job.reason > 5 || (job.action == "set" && job.reason == 4)) return;
+    if (job.action != "query" && job.action != "off" && job.action != "set") return;
+    if (job.action == "set") {
+        // номер подставляется в AT-команду — пропускаем только + и цифры
+        if (job.number.length() < 5 || job.number.length() > 20) return;
+        for (unsigned int i = 0; i < job.number.length(); i++) {
+            char c = job.number[i];
+            if (!(isdigit(c) || (i == 0 && c == '+'))) return;
+        }
+    }
+    if (fwdQueue.size() >= FWD_QUEUE_MAX) return;
+    fwdQueue.push_back(job);
+}
+
 // ── Статус и команды через MQTT ────────────────────────
 
 // Публикует метрики устройства в MQTT_STATUS_TOPIC (retained).
@@ -823,6 +957,10 @@ void resetModem() {
 void onMqttMessage(char* topic, byte* payload, unsigned int length) {
     if (strcmp(topic, MQTT_SEND_TOPIC) == 0) {
         enqueueSend(payload, length);
+        return;
+    }
+    if (strcmp(topic, MQTT_FORWARD_TOPIC) == 0) {
+        enqueueFwd(payload, length);
         return;
     }
     if (strcmp(topic, MQTT_USSD_TOPIC) == 0) {
@@ -924,6 +1062,13 @@ void loop() {
         SendJob job = sendQueue.front();
         sendQueue.erase(sendQueue.begin());
         processSendJob(job);
+    }
+
+    // Переадресация звонков
+    if (!fwdQueue.empty()) {
+        FwdJob job = fwdQueue.front();
+        fwdQueue.erase(fwdQueue.begin());
+        processFwdJob(job);
     }
 
     // USSD-запросы

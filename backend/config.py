@@ -44,6 +44,7 @@ STATUS_TOPICS = {}  # sms/status/<x> — метрики устройства, в
 SEND_RESULT_TOPICS = {}  # sms/send-result/<x> — результат отправки SMS шлюзом
 REPORT_TOPICS = {}       # sms/report/<x> — отчёты о доставке (SMS-STATUS-REPORT, PDU)
 USSD_RESULT_TOPICS = {}  # sms/ussd-result/<x> — ответы на USSD-запросы
+FORWARD_RESULT_TOPICS = {}  # sms/forward-result/<x> — состояние переадресации звонков
 DEBUG_TOPICS = {}        # sms/debug/<x> — диагностические строки прошивки (только в журнал)
 BOTS = []                # по одному на шлюз: для приёма команд /send из Telegram
 for gw in _raw["gateways"]:
@@ -71,6 +72,10 @@ for gw in _raw["gateways"]:
     USSD_RESULT_TOPICS[
         gw.get("ussd_result_topic") or mqtt_topic.replace("/incoming/", "/ussd-result/")
     ] = entry
+    entry["forward_topic"] = gw.get("forward_topic") or mqtt_topic.replace("/incoming/", "/forward/")
+    FORWARD_RESULT_TOPICS[
+        gw.get("forward_result_topic") or mqtt_topic.replace("/incoming/", "/forward-result/")
+    ] = entry
     DEBUG_TOPICS[gw.get("debug_topic") or mqtt_topic.replace("/incoming/", "/debug/")] = entry
     BOTS.append(entry)
     AVAILABILITY_TOPICS[availability_topic] = entry
@@ -80,3 +85,4 @@ SEND_MAX_PARTS = _raw.get("send_max_parts", 6)             # максимум ч
 SEND_RATE_LIMIT_PER_MIN = _raw.get("send_rate_limit_per_min", 5)  # на шлюз
 SEND_RESULT_TIMEOUT_SEC = _raw.get("send_result_timeout_sec", 120)
 USSD_TIMEOUT_SEC = _raw.get("ussd_timeout_sec", 60)
+FORWARD_TIMEOUT_SEC = _raw.get("forward_timeout_sec", 180)  # до 4 запросов к сети по ~30 с
