@@ -51,6 +51,15 @@ std::vector<SendJob> sendQueue;
 const size_t SEND_QUEUE_MAX = 4;
 long recentSendIds[8] = {0};      // дедупликация повторной доставки MQTT (QoS 1)
 uint8_t recentSendPos = 0;
+struct UssdJob {
+    long id = 0;
+    String code;
+    bool cancel = false;
+};
+std::vector<UssdJob> ussdQueue;
+const size_t USSD_QUEUE_MAX = 2;
+long recentUssdIds[8] = {0};
+uint8_t recentUssdPos = 0;
 bool expectCdsPdu = false;        // после "+CDS: <len>" следующая строка — PDU отчёта
 
 // ── Диагностика в MQTT ─────────────────────────────────
@@ -191,6 +200,7 @@ bool initSIM900() {
 
     sendATok("ATE0");              // отключить эхо
     sendATok("AT+CMGF=0");        // PDU режим
+    sendATok("AT+CSCS=\"GSM\""); // текст USSD в GSM-кодировке (UCS-2 ответы придут в hex)
     sendATok("AT+CREG=1");         // URC +CREG: <stat> при смене регистрации (диагностика)
     sendATok("AT+CNMI=2,1,0,1,0"); // +CMTI при новой SMS, +CDS (отчёт о доставке) напрямую
 
@@ -215,6 +225,7 @@ void ensureMQTT() {
         mqtt.publish(MQTT_AVAILABILITY_TOPIC, "online", true); // birth-сообщение
         mqtt.subscribe(MQTT_CMD_TOPIC);
         mqtt.subscribe(MQTT_SEND_TOPIC, 1);
+        mqtt.subscribe(MQTT_USSD_TOPIC, 1);
         flushDbg();
         dbg("MQTT connected, wifi_rssi=%d", WiFi.RSSI());
         Serial.printf("[MQTT] Subscribed to %s, %s\n", MQTT_CMD_TOPIC, MQTT_SEND_TOPIC);
@@ -623,6 +634,121 @@ void enqueueSend(const byte* payload, unsigned int length) {
     sendQueue.push_back(job);
 }
 
+// ── USSD ───────────────────────────────────────────────
+
+// Разбирает строку URC "+CUSD: <n>[,"<text>",<dcs>]" из буфера.
+// Возвращает true, когда строка пришла целиком (текст может содержать переводы строк).
+bool parseCusd(const String& buf, int& n, String& text, int& dcs) {
+    int p = buf.indexOf("+CUSD:");
+    if (p == -1) return false;
+    int eol = buf.indexOf('\n', p);
+    int q1 = buf.indexOf('"', p);
+
+    if (q1 == -1 || (eol != -1 && eol < q1)) {  // без текста, например "+CUSD: 2"
+        if (eol == -1) return false;
+        n = buf.substring(p + 6).toInt();
+        text = "";
+        dcs = 0;
+        return true;
+    }
+
+    int q2 = buf.lastIndexOf('"');
+    if (q2 <= q1) return false;
+    int tail = buf.indexOf('\n', q2);
+    if (tail == -1) return false;
+
+    n = buf.substring(p + 6).toInt();
+    text = buf.substring(q1 + 1, q2);
+    int comma = buf.indexOf(',', q2);
+    dcs = (comma != -1 && comma < tail) ? buf.substring(comma + 1).toInt() : 0;
+    return true;
+}
+
+void publishUssdResult(long id, bool ok, int n, const String& text, int dcs, const String& err) {
+    if (!mqtt.connected()) {
+        Serial.println("[USSD] MQTT disconnected, result not published");
+        return;
+    }
+    JsonDocument doc;
+    doc["id"]     = id;
+    doc["status"] = ok ? "ok" : "error";
+    if (ok) {
+        doc["n"]    = n;
+        doc["text"] = text;
+        doc["dcs"]  = dcs;
+    } else {
+        doc["error"] = err;
+    }
+    String body;
+    serializeJson(doc, body);
+    mqtt.publish(MQTT_USSD_RESULT_TOPIC, body.c_str());
+}
+
+void processUssdJob(const UssdJob& job) {
+    Serial.printf("[USSD] Job %ld: %s\n", job.id, job.cancel ? "cancel" : job.code.c_str());
+
+    String err;
+    if (!sim900Ok) err = "modem not ready";
+    else if (!job.cancel && netStat != 1 && netStat != 5) err = "no network";
+
+    if (err.length() > 0) {
+        publishUssdResult(job.id, false, 0, "", 0, err);
+        return;
+    }
+
+    processSIMData();  // разобрать накопившиеся URC до начала диалога
+
+    String cmd = job.cancel ? String("AT+CUSD=2") : "AT+CUSD=1,\"" + job.code + "\",15";
+    simSerial.println(cmd);
+
+    // Сначала приходит OK, затем (через 2-30 с) URC +CUSD с ответом оператора.
+    String buf;
+    int n = 0, dcs = 0;
+    String text;
+    bool done = waitModem(buf, 35000, [&](const String& b) {
+        return b.indexOf("ERROR") != -1 || parseCusd(b, n, text, dcs);
+    });
+    Serial.printf("[USSD] ← %s\n", buf.c_str());
+    dbg("USSD %s -> %s", job.cancel ? "cancel" : job.code.c_str(), oneLine(buf).c_str());
+
+    if (done && buf.indexOf("+CUSD:") != -1) {
+        publishUssdResult(job.id, true, n, text, dcs, "");
+    } else if (buf.indexOf("ERROR") != -1) {
+        int e = buf.indexOf("ERROR");
+        int eol = buf.indexOf('\r', e);
+        String line = buf.substring(buf.lastIndexOf('+', e), eol == -1 ? buf.length() : eol);
+        line.trim();
+        publishUssdResult(job.id, false, 0, "", 0, line);
+    } else if (job.cancel && buf.indexOf("OK") != -1) {
+        publishUssdResult(job.id, true, 2, "", 0, "");  // сессия закрыта, +CUSD не будет
+    } else {
+        publishUssdResult(job.id, false, 0, "", 0, "ussd timeout");
+    }
+}
+
+// Разбор JSON-задания: {"id":N,"code":"*101#"} или {"id":N,"cancel":true}
+void enqueueUssd(const byte* payload, unsigned int length) {
+    JsonDocument doc;
+    if (deserializeJson(doc, payload, length)) {
+        Serial.println("[USSD] Bad JSON");
+        return;
+    }
+    UssdJob job;
+    job.id = doc["id"] | 0L;
+    if (job.id == 0) return;
+
+    for (long seen : recentUssdIds) {
+        if (seen == job.id) return;  // повторная доставка MQTT
+    }
+    recentUssdIds[recentUssdPos++ % 8] = job.id;
+
+    job.cancel = doc["cancel"] | false;
+    job.code = doc["code"].as<String>();
+    if (!job.cancel && job.code.length() == 0) return;
+    if (ussdQueue.size() >= USSD_QUEUE_MAX) return;  // бэкенд отвалится по таймауту
+    ussdQueue.push_back(job);
+}
+
 // ── Статус и команды через MQTT ────────────────────────
 
 // Публикует метрики устройства в MQTT_STATUS_TOPIC (retained).
@@ -697,6 +823,10 @@ void resetModem() {
 void onMqttMessage(char* topic, byte* payload, unsigned int length) {
     if (strcmp(topic, MQTT_SEND_TOPIC) == 0) {
         enqueueSend(payload, length);
+        return;
+    }
+    if (strcmp(topic, MQTT_USSD_TOPIC) == 0) {
+        enqueueUssd(payload, length);
         return;
     }
 
@@ -794,6 +924,13 @@ void loop() {
         SendJob job = sendQueue.front();
         sendQueue.erase(sendQueue.begin());
         processSendJob(job);
+    }
+
+    // USSD-запросы
+    if (!ussdQueue.empty()) {
+        UssdJob job = ussdQueue.front();
+        ussdQueue.erase(ussdQueue.begin());
+        processUssdJob(job);
     }
 
     // Периодический опрос неотправленных SMS

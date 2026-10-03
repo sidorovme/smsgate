@@ -6,6 +6,7 @@ Listens to MQTT, parses PDU, assembles multipart, sends to Telegram.
 import json
 import logging
 import random
+import re
 import signal
 import sys
 import threading
@@ -45,8 +46,13 @@ _expected_offline = {}  # availability topic -> время команды reboot
 EXPECTED_REBOOT_SEC = 60
 
 USAGE = "Использование: <code>/send +375291234567 Текст сообщения</code>"
+_ussd_pending = {}  # id -> gateway name (ждём ответ шлюза)
+_ussd_id = int(time.time()) % 1_000_000_000
+USSD_RE = re.compile(r"^[0-9*#+]{1,64}$")
+
 HELP = (
     "/send <code>+375291234567 текст</code> — отправить SMS\n"
+    "/ussd <code>*101#</code> — USSD-запрос (<code>/ussd cancel</code> закрывает сессию)\n"
     "/status — состояние шлюза\n"
     "/reboot — перезагрузить шлюз\n"
     "/reset_modem — перезапустить модем"
@@ -66,6 +72,7 @@ def on_connect(client, userdata, flags, reason_code, properties):
             + list(config.SEND_RESULT_TOPICS)
             + list(config.REPORT_TOPICS)
             + list(config.DEBUG_TOPICS)
+            + list(config.USSD_RESULT_TOPICS)
         ):
             log.info("MQTT subscribing to %s", topic)
             client.subscribe(topic)
@@ -180,6 +187,8 @@ def handle_command(gateway, text):
     cmd = parts[0].split("@")[0].lower()
     if cmd == "/send":
         handle_send_command(gateway, parts)
+    elif cmd == "/ussd":
+        handle_ussd_command(gateway, parts[1] if len(parts) > 1 else "")
     elif cmd == "/status":
         handle_status_command(gateway)
     elif cmd in ("/reboot", "/reset_modem", "/reset-modem"):
@@ -266,6 +275,88 @@ def handle_control_command(gateway, command):
         _reply(gateway, f"🔄 Перезагружаю <b>{name}</b>, сообщу, когда вернётся в сеть.")
     else:
         _reply(gateway, f"🔄 Перезапускаю модем <b>{name}</b> (около 10–15 с).")
+
+
+def handle_ussd_command(gateway, arg):
+    """Handle '/ussd <code>' or '/ussd cancel'."""
+    global _ussd_id
+    name = telegram.escape_html(gateway["name"])
+    cancel = arg.lower() == "cancel"
+    if not cancel and not USSD_RE.match(arg):
+        _reply(gateway, "Использование: <code>/ussd *101#</code> (допустимы цифры и символы * # +)\n"
+                        "Выбор в меню: <code>/ussd 1</code>, закрыть сессию: <code>/ussd cancel</code>")
+        return
+
+    if _availability.get(gateway["availability_topic"]) != "online":
+        _reply(gateway, f"❌ <b>{name}</b> недоступен (offline). Повторите позже.")
+        return
+    net = _network.get(gateway["status_topic"])
+    if not cancel and net is not None and not net[0]:
+        _reply(gateway, f"❌ SIM-карта <b>{name}</b> не в сети. Повторите позже.")
+        return
+    if _rate_limited(gateway):
+        _reply(gateway, f"❌ Превышен лимит: не более {config.SEND_RATE_LIMIT_PER_MIN} запросов в минуту")
+        return
+
+    with _send_lock:
+        _ussd_id += 1
+        req_id = _ussd_id
+    payload = {"id": req_id, "cancel": True} if cancel else {"id": req_id, "code": arg}
+    info = _client.publish(gateway["ussd_topic"], json.dumps(payload), qos=1)
+    if info.rc != mqtt.MQTT_ERR_SUCCESS:
+        _reply(gateway, "❌ Не удалось передать команду шлюзу (MQTT).")
+        return
+
+    log.info("USSD #%d %s via %s", req_id, "cancel" if cancel else arg, gateway["name"])
+    _ussd_pending[req_id] = gateway["name"]
+    _reply(gateway, "⏳ Жду ответ оператора…")
+
+    def on_timeout():
+        if _ussd_pending.pop(req_id, None) is not None:
+            _reply(gateway, f"❌ Нет ответа от <b>{name}</b> на USSD-запрос.")
+
+    timer = threading.Timer(config.USSD_TIMEOUT_SEC, on_timeout)
+    timer.daemon = True
+    timer.start()
+
+
+def _decode_ussd(text, dcs):
+    """USSD text from the modem: UCS-2 answers (dcs 72 / 0x08 family) arrive as hex."""
+    if (dcs & 0x0C) == 0x08 or dcs == 72:
+        try:
+            return bytes.fromhex(text).decode("utf-16-be", errors="replace")
+        except ValueError:
+            pass
+    return text
+
+
+def handle_ussd_result(topic, msg):
+    gateway = config.USSD_RESULT_TOPICS.get(topic)
+    if gateway is None:
+        return
+
+    result = json.loads(msg.payload.decode())
+    req_id = int(result["id"])
+    if _ussd_pending.pop(req_id, None) is None:
+        return  # поздний ответ после таймаута или чужой
+
+    if result.get("status") != "ok":
+        error = telegram.escape_html(str(result.get("error", "неизвестная ошибка")))
+        _reply(gateway, f"❌ USSD: {error}")
+        return
+
+    n = int(result.get("n", 0))
+    text = _decode_ussd(result.get("text", ""), int(result.get("dcs", 0)))
+    log.info("USSD #%d result n=%d (%d chars)", req_id, n, len(text))
+
+    body = telegram.escape_html(text) if text else "<i>(пустой ответ)</i>"
+    if n == 1:
+        body += "\n\n<i>Ожидается ответ: <code>/ussd &lt;выбор&gt;</code>, закрыть: <code>/ussd cancel</code></i>"
+    elif n == 2:
+        body += "\n\n<i>Сессия завершена оператором</i>"
+    elif n == 4:
+        body += "\n\n<i>Операция не поддерживается</i>"
+    _reply(gateway, "📟 " + body)
 
 
 def handle_send_command(gateway, parts):
@@ -387,6 +478,10 @@ def on_message(client, userdata, msg):
 
         if topic in config.STATUS_TOPICS:
             handle_status(topic, msg)
+            return
+
+        if topic in config.USSD_RESULT_TOPICS:
+            handle_ussd_result(topic, msg)
             return
 
         if topic in config.DEBUG_TOPICS:

@@ -176,6 +176,7 @@ def _safe_error(e: Exception) -> str:
 
 BOT_COMMANDS = [
     {"command": "status", "description": "Состояние шлюза"},
+    {"command": "ussd", "description": "USSD-запрос: /ussd *101#"},
     {"command": "send", "description": "Отправить SMS: /send +375... текст"},
     {"command": "reboot", "description": "Перезагрузить шлюз"},
     {"command": "reset_modem", "description": "Перезапустить модем"},

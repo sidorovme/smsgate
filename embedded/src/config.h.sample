@@ -14,6 +14,8 @@
 #define MQTT_SEND_TOPIC         "sms/send"          // команды на отправку SMS (JSON с PDU)
 #define MQTT_SEND_RESULT_TOPIC  "sms/send-result"   // результат отправки
 #define MQTT_REPORT_TOPIC       "sms/report"        // отчёты о доставке (PDU)
+#define MQTT_USSD_TOPIC         "sms/ussd"          // USSD-запросы (JSON)
+#define MQTT_USSD_RESULT_TOPIC  "sms/ussd-result"   // ответы на USSD
 #define MQTT_DEBUG_TOPIC        "sms/debug"         // диагностические строки (не retained)
 #define DEVICE_ID      "gate-1"
 
