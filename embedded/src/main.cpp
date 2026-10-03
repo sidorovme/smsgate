@@ -4,6 +4,7 @@
 #include <ArduinoJson.h>
 #include <esp_task_wdt.h>
 #include <vector>
+#include <stdarg.h>
 #include "config.h"
 #include "display.h"
 
@@ -51,6 +52,51 @@ const size_t SEND_QUEUE_MAX = 4;
 long recentSendIds[8] = {0};      // дедупликация повторной доставки MQTT (QoS 1)
 uint8_t recentSendPos = 0;
 bool expectCdsPdu = false;        // после "+CDS: <len>" следующая строка — PDU отчёта
+
+// ── Диагностика в MQTT ─────────────────────────────────
+// Строки идут в Serial и в MQTT_DEBUG_TOPIC. Пока брокер недоступен, последние
+// DBG_BUF_N строк копятся и уходят после переподключения.
+#define DBG_BUF_N 16
+String   dbgBuf[DBG_BUF_N];
+uint32_t dbgHead  = 0;
+uint8_t  dbgCount = 0;
+
+void dbg(const char* fmt, ...) {
+    char line[200];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+
+    char out[240];
+    snprintf(out, sizeof(out), "[%lus] %s", (unsigned long)((millis() - startTime) / 1000), line);
+    Serial.printf("[DBG] %s\n", out);
+
+    if (mqtt.connected()) {
+        mqtt.publish(MQTT_DEBUG_TOPIC, out);
+    } else {
+        dbgBuf[dbgHead++ % DBG_BUF_N] = out;
+        if (dbgCount < DBG_BUF_N) dbgCount++;
+    }
+}
+
+// Отправить накопленные строки (вызывается сразу после подключения к брокеру).
+void flushDbg() {
+    uint32_t first = dbgCount < DBG_BUF_N ? 0 : dbgHead;
+    for (uint8_t i = 0; i < dbgCount; i++) {
+        mqtt.publish(MQTT_DEBUG_TOPIC, dbgBuf[(first + i) % DBG_BUF_N].c_str());
+    }
+    dbgCount = 0;
+    dbgHead = 0;
+}
+
+// Ответ модема в одну строку для лога: переводы строк → "|".
+String oneLine(String s) {
+    s.replace("\r", "");
+    s.trim();
+    s.replace("\n", "|");
+    return s;
+}
 
 // ── Предварительные объявления ─────────────────────────
 void publishStatus();
@@ -145,6 +191,7 @@ bool initSIM900() {
 
     sendATok("ATE0");              // отключить эхо
     sendATok("AT+CMGF=0");        // PDU режим
+    sendATok("AT+CREG=1");         // URC +CREG: <stat> при смене регистрации (диагностика)
     sendATok("AT+CNMI=2,1,0,1,0"); // +CMTI при новой SMS, +CDS (отчёт о доставке) напрямую
 
     Serial.println("[SIM] Ready");
@@ -168,6 +215,8 @@ void ensureMQTT() {
         mqtt.publish(MQTT_AVAILABILITY_TOPIC, "online", true); // birth-сообщение
         mqtt.subscribe(MQTT_CMD_TOPIC);
         mqtt.subscribe(MQTT_SEND_TOPIC, 1);
+        flushDbg();
+        dbg("MQTT connected, wifi_rssi=%d", WiFi.RSSI());
         Serial.printf("[MQTT] Subscribed to %s, %s\n", MQTT_CMD_TOPIC, MQTT_SEND_TOPIC);
         publishStatus();
     } else {
@@ -292,6 +341,14 @@ void handleSimLine(const String& line) {
         expectCdsPdu = true;
         return;
     }
+
+    // Остальные URC (+CREG, UNDER-VOLTAGE, RDY, Call Ready...) — в диагностику.
+    if (!expectCdsPdu) {
+        dbg("URC: %s", line.c_str());
+        if (line.indexOf("VOLTAGE") != -1 || line.indexOf("POWER DOWN") != -1) {
+            lastError = "Modem: " + line;
+        }
+    }
     if (expectCdsPdu && line.length() >= 10) {
         expectCdsPdu = false;
         if (!mqtt.connected()) {
@@ -379,24 +436,37 @@ bool updateNetwork() {
 
     String r = sendAT("AT+CREG?");
     int p = r.indexOf("+CREG:");
+    bool cregOk = false;
     if (p != -1) {
         int comma = r.indexOf(',', p);
-        if (comma != -1) netStat = r.substring(comma + 1).toInt();
+        if (comma != -1) {
+            netStat = r.substring(comma + 1).toInt();
+            cregOk = true;
+        }
     }
+    if (!cregOk) dbg("CREG? PARSE FAIL: %s", oneLine(r).c_str());
 
     netOperator = "";
+    String copsRaw = "-", csqRaw = "-";
     if (netStat == 1 || netStat == 5) {
         String o = sendAT("AT+COPS?");
+        copsRaw = oneLine(o);
         int q1 = o.indexOf('"');
         int q2 = q1 == -1 ? -1 : o.indexOf('"', q1 + 1);
         if (q2 != -1) netOperator = o.substring(q1 + 1, q2);
-
-        String c = sendAT("AT+CSQ");
-        int cp = c.indexOf("+CSQ:");
-        if (cp != -1) netCsq = c.substring(cp + 5).toInt();
-    } else {
-        netCsq = 99;
+        else dbg("COPS? PARSE FAIL: %s", copsRaw.c_str());
     }
+
+    // CSQ читаем всегда (и без регистрации) — для корреляции потерь сети с уровнем сигнала
+    String c = sendAT("AT+CSQ");
+    csqRaw = oneLine(c);
+    int cp = c.indexOf("+CSQ:");
+    if (cp != -1) netCsq = c.substring(cp + 5).toInt();
+    else dbg("CSQ PARSE FAIL: %s", csqRaw.c_str());
+
+    dbg("NET stat=%d(was %d) op='%s' csq=%d | CREG=%s | COPS=%s",
+        netStat, oldStat, netOperator.c_str(), netCsq,
+        oneLine(r).c_str(), copsRaw.c_str());
 
     return netStat != oldStat || netOperator != oldOp;
 }

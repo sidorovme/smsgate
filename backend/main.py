@@ -65,6 +65,7 @@ def on_connect(client, userdata, flags, reason_code, properties):
             list(config.STATUS_TOPICS)
             + list(config.SEND_RESULT_TOPICS)
             + list(config.REPORT_TOPICS)
+            + list(config.DEBUG_TOPICS)
         ):
             log.info("MQTT subscribing to %s", topic)
             client.subscribe(topic)
@@ -386,6 +387,11 @@ def on_message(client, userdata, msg):
 
         if topic in config.STATUS_TOPICS:
             handle_status(topic, msg)
+            return
+
+        if topic in config.DEBUG_TOPICS:
+            log.info("[%s] DBG %s", config.DEBUG_TOPICS[topic]["name"],
+                     msg.payload.decode(errors="replace"))
             return
 
         if topic in config.SEND_RESULT_TOPICS:

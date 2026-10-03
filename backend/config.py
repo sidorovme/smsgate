@@ -43,6 +43,7 @@ AVAILABILITY_TOPICS = {}
 STATUS_TOPICS = {}  # sms/status/<x> — метрики устройства, в т.ч. состояние сотовой сети
 SEND_RESULT_TOPICS = {}  # sms/send-result/<x> — результат отправки SMS шлюзом
 REPORT_TOPICS = {}       # sms/report/<x> — отчёты о доставке (SMS-STATUS-REPORT, PDU)
+DEBUG_TOPICS = {}        # sms/debug/<x> — диагностические строки прошивки (только в журнал)
 BOTS = []                # по одному на шлюз: для приёма команд /send из Telegram
 for gw in _raw["gateways"]:
     entry = {
@@ -65,6 +66,7 @@ for gw in _raw["gateways"]:
         gw.get("send_result_topic") or mqtt_topic.replace("/incoming/", "/send-result/")
     ] = entry
     REPORT_TOPICS[gw.get("report_topic") or mqtt_topic.replace("/incoming/", "/report/")] = entry
+    DEBUG_TOPICS[gw.get("debug_topic") or mqtt_topic.replace("/incoming/", "/debug/")] = entry
     BOTS.append(entry)
     AVAILABILITY_TOPICS[availability_topic] = entry
 
