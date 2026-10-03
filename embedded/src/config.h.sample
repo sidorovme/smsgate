@@ -7,18 +7,7 @@
 // ── MQTT ──────────────────────────────────────────────
 #define MQTT_BROKER    "1.2.3.4"
 #define MQTT_PORT      1883
-#define MQTT_TOPIC              "sms/incoming"             // входящие SMS (PDU)
-#define MQTT_STATUS_TOPIC       "sms/status"               // метрики устройства (retained)
-#define MQTT_AVAILABILITY_TOPIC "sms/status/availability"  // online/offline (LWT, retained)
-#define MQTT_CMD_TOPIC          "sms/cmd"                  // команды: reboot, reset-modem, status
-#define MQTT_SEND_TOPIC         "sms/send"          // команды на отправку SMS (JSON с PDU)
-#define MQTT_SEND_RESULT_TOPIC  "sms/send-result"   // результат отправки
-#define MQTT_REPORT_TOPIC       "sms/report"        // отчёты о доставке (PDU)
-#define MQTT_USSD_TOPIC         "sms/ussd"          // USSD-запросы (JSON)
-#define MQTT_USSD_RESULT_TOPIC  "sms/ussd-result"   // ответы на USSD
-#define MQTT_FORWARD_TOPIC      "sms/forward"       // управление переадресацией звонков (JSON)
-#define MQTT_FORWARD_RESULT_TOPIC "sms/forward-result" // состояние переадресации
-#define MQTT_DEBUG_TOPIC        "sms/debug"         // диагностические строки (не retained)
+#define MQTT_BASE      "sms/gate-1"   // все топики шлюза: <MQTT_BASE>/incoming, /status, ... (см. topics.h)
 #define DEVICE_ID      "gate-1"
 
 // ── SIM900 UART ────────────────────────────────────────

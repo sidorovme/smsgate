@@ -151,6 +151,8 @@ def handle_status(topic, msg):
     roaming = bool(status.get("net_roaming"))
 
     prev = _network.get(topic)
+    if registered and not operator and prev and prev[0]:
+        operator = prev[1]  # оператора не удалось прочитать — это не смена оператора
     _network[topic] = (registered, operator)
 
     if prev == (registered, operator):

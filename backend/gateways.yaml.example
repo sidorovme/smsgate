@@ -5,24 +5,24 @@ mqtt:
 db_path: "sms.db"
 multipart_timeout_sec: 300
 
-# Отправка SMS (команда /send в Telegram-чате шлюза)
+# Команды Telegram (/send, /ussd, /forward)
 send_max_parts: 6              # максимум частей в одном сообщении
-send_rate_limit_per_min: 5     # максимум отправок в минуту на шлюз
-send_result_timeout_sec: 120   # сколько ждать ответа шлюза
+send_rate_limit_per_min: 5     # максимум запросов в минуту на шлюз
+send_result_timeout_sec: 120   # сколько ждать ответа шлюза на отправку
+ussd_timeout_sec: 60
+forward_timeout_sec: 180
 
-# availability_topic — топик keep-alive/LWT шлюза (online/offline).
-# По умолчанию выводится из mqtt_topic: sms/incoming/<x> → sms/status/<x>/availability.
-# Задавайте явно, только если топик в прошивке отличается от этой схемы.
-# Топики отправки выводятся из mqtt_topic: sms/incoming/<x> → sms/send/<x>,
-# sms/send-result/<x>, sms/report/<x> (можно задать явно: send_topic, send_result_topic, report_topic).
+# Каждый шлюз — один параметр mqtt_base; все топики строятся от него:
+#   <mqtt_base>/incoming, /status, /availability, /cmd, /send, /send-result,
+#   /report, /ussd, /ussd-result, /forward, /forward-result, /debug
+# В прошивке то же значение задаётся в config.h: #define MQTT_BASE "sms/gate-1".
 gateways:
   - name: "gate-1"
-    mqtt_topic: "sms/incoming/gate-1"
-    # availability_topic: "sms/status/gate-1/availability"
+    mqtt_base: "sms/gate-1"
     telegram_bot_token: "123456:ABC-DEF..."
     telegram_chat_id: "-100123456789"
 
   - name: "gate-2"
-    mqtt_topic: "sms/incoming/gate-2"
+    mqtt_base: "sms/gate-2"
     telegram_bot_token: "654321:XYZ-UVW..."
     telegram_chat_id: "-100987654321"

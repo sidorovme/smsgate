@@ -33,52 +33,53 @@ DB_PATH = _raw.get("db_path", "sms.db")
 MULTIPART_TIMEOUT_SEC = _raw.get("multipart_timeout_sec", 300)
 
 # ── Gateways ──────────────────────────────────────────
-# GATEWAYS:            {mqtt_topic:        {name, telegram_bot_token, telegram_chat_id}}
-# AVAILABILITY_TOPICS: {availability_topic: {name, telegram_bot_token, telegram_chat_id}}
+# Каждый шлюз задаётся одним параметром mqtt_base (например "sms/gate-yauheni"),
+# все топики — <mqtt_base>/<суффикс>. Та же схема в прошивке (embedded/src/topics.h).
 #
-# availability_topic по умолчанию выводится из mqtt_topic
-# (sms/incoming/<x> → sms/status/<x>/availability), но может быть задан явно.
-GATEWAYS = {}
-AVAILABILITY_TOPICS = {}
-STATUS_TOPICS = {}  # sms/status/<x> — метрики устройства, в т.ч. состояние сотовой сети
-SEND_RESULT_TOPICS = {}  # sms/send-result/<x> — результат отправки SMS шлюзом
-REPORT_TOPICS = {}       # sms/report/<x> — отчёты о доставке (SMS-STATUS-REPORT, PDU)
-USSD_RESULT_TOPICS = {}  # sms/ussd-result/<x> — ответы на USSD-запросы
-FORWARD_RESULT_TOPICS = {}  # sms/forward-result/<x> — состояние переадресации звонков
-DEBUG_TOPICS = {}        # sms/debug/<x> — диагностические строки прошивки (только в журнал)
-BOTS = []                # по одному на шлюз: для приёма команд /send из Telegram
+# Словари ниже: {топик: entry}, где entry = {name, telegram_bot_token, telegram_chat_id,
+# и топики шлюза для публикации: send_topic, cmd_topic, ussd_topic, forward_topic,
+# а также availability_topic и status_topic для поиска состояния шлюза}.
+GATEWAYS = {}               # <base>/incoming — входящие SMS (PDU)
+AVAILABILITY_TOPICS = {}    # <base>/availability — online/offline (LWT, retained)
+STATUS_TOPICS = {}          # <base>/status — метрики устройства, в т.ч. состояние сети SIM
+SEND_RESULT_TOPICS = {}     # <base>/send-result — результат отправки SMS
+REPORT_TOPICS = {}          # <base>/report — отчёты о доставке (SMS-STATUS-REPORT, PDU)
+USSD_RESULT_TOPICS = {}     # <base>/ussd-result — ответы на USSD-запросы
+FORWARD_RESULT_TOPICS = {}  # <base>/forward-result — состояние переадресации звонков
+DEBUG_TOPICS = {}           # <base>/debug — диагностические строки прошивки (только в журнал)
+BOTS = []                   # по одному на шлюз: приём команд из Telegram
 for gw in _raw["gateways"]:
+    if "mqtt_topic" in gw or "mqtt_base" not in gw:
+        print(
+            f"Gateway {gw.get('name')!r}: задайте mqtt_base (например \"sms/gate-1\"), "
+            "старый параметр mqtt_topic больше не поддерживается.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    base = gw["mqtt_base"].rstrip("/")
     entry = {
         "name": gw["name"],
         "telegram_bot_token": gw["telegram_bot_token"],
         "telegram_chat_id": str(gw["telegram_chat_id"]),
+        # топики, в которые бэкенд публикует
+        "send_topic": f"{base}/send",
+        "cmd_topic": f"{base}/cmd",
+        "ussd_topic": f"{base}/ussd",
+        "forward_topic": f"{base}/forward",
+        # топики шлюза, по которым ищется его последнее состояние
+        "availability_topic": f"{base}/availability",
+        "status_topic": f"{base}/status",
     }
-    mqtt_topic = gw["mqtt_topic"]
-    availability_topic = gw.get("availability_topic") or (
-        mqtt_topic.replace("/incoming/", "/status/") + "/availability"
-    )
-    status_topic = gw.get("status_topic") or mqtt_topic.replace("/incoming/", "/status/")
-    entry["send_topic"] = gw.get("send_topic") or mqtt_topic.replace("/incoming/", "/send/")
-    entry["availability_topic"] = availability_topic
-    entry["status_topic"] = status_topic
-    entry["cmd_topic"] = gw.get("cmd_topic") or mqtt_topic.replace("/incoming/", "/cmd/")
-    GATEWAYS[mqtt_topic] = entry
-    STATUS_TOPICS[status_topic] = entry
-    SEND_RESULT_TOPICS[
-        gw.get("send_result_topic") or mqtt_topic.replace("/incoming/", "/send-result/")
-    ] = entry
-    REPORT_TOPICS[gw.get("report_topic") or mqtt_topic.replace("/incoming/", "/report/")] = entry
-    entry["ussd_topic"] = gw.get("ussd_topic") or mqtt_topic.replace("/incoming/", "/ussd/")
-    USSD_RESULT_TOPICS[
-        gw.get("ussd_result_topic") or mqtt_topic.replace("/incoming/", "/ussd-result/")
-    ] = entry
-    entry["forward_topic"] = gw.get("forward_topic") or mqtt_topic.replace("/incoming/", "/forward/")
-    FORWARD_RESULT_TOPICS[
-        gw.get("forward_result_topic") or mqtt_topic.replace("/incoming/", "/forward-result/")
-    ] = entry
-    DEBUG_TOPICS[gw.get("debug_topic") or mqtt_topic.replace("/incoming/", "/debug/")] = entry
+    GATEWAYS[f"{base}/incoming"] = entry
+    AVAILABILITY_TOPICS[entry["availability_topic"]] = entry
+    STATUS_TOPICS[entry["status_topic"]] = entry
+    SEND_RESULT_TOPICS[f"{base}/send-result"] = entry
+    REPORT_TOPICS[f"{base}/report"] = entry
+    USSD_RESULT_TOPICS[f"{base}/ussd-result"] = entry
+    FORWARD_RESULT_TOPICS[f"{base}/forward-result"] = entry
+    DEBUG_TOPICS[f"{base}/debug"] = entry
     BOTS.append(entry)
-    AVAILABILITY_TOPICS[availability_topic] = entry
 
 # ── Outgoing SMS limits ───────────────────────────────
 SEND_MAX_PARTS = _raw.get("send_max_parts", 6)             # максимум частей в одном сообщении

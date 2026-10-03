@@ -6,6 +6,7 @@
 #include <vector>
 #include <stdarg.h>
 #include "config.h"
+#include "topics.h"
 #include "display.h"
 
 // ── Глобальные переменные ──────────────────────────────
@@ -33,6 +34,8 @@ int      netStat       = -1;   // CREG stat: 0 нет, 1 home, 2 поиск, 3 �
 String   netOperator   = "";
 int      netCsq        = 99;   // 0..31, 99 = неизвестно
 uint32_t lastNetMs     = 0;
+uint8_t  netNoReply    = 0;    // подряд неотвеченных CREG? (модем завис?)
+uint32_t lastAutoResetMs = 0;  // последний автоматический power cycle модема
 
 // Команды из MQTT выполняются в loop(), а не в callback (тяжёлая работа
 // внутри колбэка PubSubClient нежелательна).
@@ -70,7 +73,6 @@ std::vector<FwdJob> fwdQueue;
 const size_t FWD_QUEUE_MAX = 2;
 long recentFwdIds[8] = {0};
 uint8_t recentFwdPos = 0;
-bool diagDone = false;           // разовая диагностика запретов вызовов выполнена
 bool expectCdsPdu = false;        // после "+CDS: <len>" следующая строка — PDU отчёта
 
 // ── Диагностика в MQTT ─────────────────────────────────
@@ -459,39 +461,41 @@ bool updateNetwork() {
 
     String r = sendAT("AT+CREG?");
     int p = r.indexOf("+CREG:");
-    bool cregOk = false;
-    if (p != -1) {
-        int comma = r.indexOf(',', p);
-        if (comma != -1) {
-            netStat = r.substring(comma + 1).toInt();
-            cregOk = true;
-        }
+    int comma = p == -1 ? -1 : r.indexOf(',', p);
+    if (comma == -1) {
+        // Нет ответа / не разобрали: состояние не трогаем (это не «сеть пропала»),
+        // но считаем подряд идущие сбои — молчащий модем перезапустит loop().
+        netNoReply++;
+        dbg("CREG? PARSE FAIL (%d in a row): %s", netNoReply, oneLine(r).c_str());
+        return false;
     }
-    if (!cregOk) dbg("CREG? PARSE FAIL: %s", oneLine(r).c_str());
+    netNoReply = 0;
+    netStat = r.substring(comma + 1).toInt();
 
-    netOperator = "";
-    String copsRaw = "-", csqRaw = "-";
     if (netStat == 1 || netStat == 5) {
         String o = sendAT("AT+COPS?");
-        copsRaw = oneLine(o);
         int q1 = o.indexOf('"');
         int q2 = q1 == -1 ? -1 : o.indexOf('"', q1 + 1);
         if (q2 != -1) netOperator = o.substring(q1 + 1, q2);
-        else dbg("COPS? PARSE FAIL: %s", copsRaw.c_str());
+        else dbg("COPS? PARSE FAIL: %s", oneLine(o).c_str());  // прежний оператор остаётся
+    } else {
+        netOperator = "";
     }
 
     // CSQ читаем всегда (и без регистрации) — для корреляции потерь сети с уровнем сигнала
     String c = sendAT("AT+CSQ");
-    csqRaw = oneLine(c);
     int cp = c.indexOf("+CSQ:");
     if (cp != -1) netCsq = c.substring(cp + 5).toInt();
-    else dbg("CSQ PARSE FAIL: %s", csqRaw.c_str());
+    else dbg("CSQ PARSE FAIL: %s", oneLine(c).c_str());
 
-    dbg("NET stat=%d(was %d) op='%s' csq=%d | CREG=%s | COPS=%s",
-        netStat, oldStat, netOperator.c_str(), netCsq,
-        oneLine(r).c_str(), copsRaw.c_str());
-
-    return netStat != oldStat || netOperator != oldOp;
+    bool changed = netStat != oldStat || netOperator != oldOp;
+    static uint8_t beat = 0;
+    if (changed || ++beat >= 20) {  // при изменении и раз в ~5 минут
+        beat = 0;
+        dbg("NET stat=%d(was %d) op='%s' csq=%d | CREG=%s",
+            netStat, oldStat, netOperator.c_str(), netCsq, oneLine(r).c_str());
+    }
+    return changed;
 }
 
 // ── Отправка SMS ───────────────────────────────────────
@@ -855,24 +859,6 @@ void processFwdJob(const FwdJob& job) {
     }
 }
 
-// Разовая диагностика голосовых ограничений: запреты вызовов (+CLCK) и состояние модема.
-// Результат — в debug-топик. Запрос запретов идёт в сеть, поэтому делается не при загрузке.
-void netDiag() {
-    const char* cmds[] = {
-        "AT+CGMR", "AT+CFUN?", "AT+CGREG?",
-        "AT+CLCK=\"AI\",2",  // запрет всех входящих
-        "AT+CLCK=\"IR\",2",  // запрет входящих в роуминге
-        "AT+CLCK=\"AO\",2",  // запрет всех исходящих
-        "AT+CLCK=\"OI\",2",  // запрет исходящих международных
-    };
-    for (const char* c : cmds) {
-        esp_task_wdt_reset();
-        bool ok;
-        atWait(c, 20000, ok, "DIAG");
-    }
-    dbg("DIAG done");
-}
-
 // {"id":N,"action":"query|set|off","number":"+..."}
 void enqueueFwd(const byte* payload, unsigned int length) {
     JsonDocument doc;
@@ -967,6 +953,12 @@ void resetModem() {
     } else {
         Serial.println("[SIM] Reset FAILED");
         lastError = "Modem reset failed";
+        publishStatus();
+        // Модем не поднялся: перезагружаем плату (при загрузке снова power cycle),
+        // иначе sim900Ok остался бы false и опрос сети больше не запускался бы.
+        Serial.println("[SIM] Rebooting in 10s");
+        delay(10000);
+        ESP.restart();
     }
 
     publishStatus();
@@ -1035,7 +1027,12 @@ void setup() {
     displayBoot("MQTT", mqtt.connected());
 
     // SIM900 — включить питание модема
+    // Всегда с power cycle: после программной перезагрузки ESP32 зависший модем
+    // иначе остаётся без сброса и не отвечает на AT (цикл перезагрузок).
     pinMode(SIM_POWER_PIN, OUTPUT);
+    digitalWrite(SIM_POWER_PIN, LOW);
+    Serial.println("[SIM] Power OFF");
+    delay(2000);
     digitalWrite(SIM_POWER_PIN, HIGH);
     Serial.println("[SIM] Power ON (D4 HIGH)");
     delay(3000);  // дать модему время запуститься
@@ -1084,12 +1081,6 @@ void loop() {
         processSendJob(job);
     }
 
-    // Разовая диагностика запретов вызовов (через 40 с после старта, когда всё поднялось)
-    if (!diagDone && sim900Ok && mqtt.connected() && millis() - startTime > 40000) {
-        diagDone = true;
-        netDiag();
-    }
-
     // Переадресация звонков
     if (!fwdQueue.empty()) {
         FwdJob job = fwdQueue.front();
@@ -1114,6 +1105,15 @@ void loop() {
     if (sim900Ok && millis() - lastNetMs > NET_CHECK_MS) {
         lastNetMs = millis();
         if (updateNetwork()) publishStatus();
+
+        // Модем молчит на AT — перезапускаем по питанию (не чаще раза в 5 минут)
+        if (netNoReply >= 3 && (lastAutoResetMs == 0 || millis() - lastAutoResetMs > 300000)) {
+            dbg("Modem not responding (%d CREG? fails), auto reset", netNoReply);
+            lastAutoResetMs = millis();
+            netNoReply = 0;
+            lastError = "Modem hung, auto reset";
+            pendingCmd = CMD_RESET_MODEM;
+        }
     }
 
     // Периодическая публикация статуса в MQTT
