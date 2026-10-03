@@ -87,3 +87,12 @@ SEND_RATE_LIMIT_PER_MIN = _raw.get("send_rate_limit_per_min", 5)  # на шлю�
 SEND_RESULT_TIMEOUT_SEC = _raw.get("send_result_timeout_sec", 120)
 USSD_TIMEOUT_SEC = _raw.get("ussd_timeout_sec", 60)
 FORWARD_TIMEOUT_SEC = _raw.get("forward_timeout_sec", 180)  # до 4 запросов к сети по ~30 с
+
+# ── Alerts (health) ───────────────────────────────────
+# Шлюз считается здоровым, когда он online И SIM зарегистрирована в сети.
+# О проблеме сообщаем, только если она держится дольше порога; о восстановлении — если до
+# этого было сообщение о проблеме (или после перезагрузки по команде) и состояние
+# продержалось здоровым ALERT_RECOVER_HOLD_SEC.
+ALERT_OFFLINE_AFTER_SEC = _raw.get("alert_offline_after_sec", 120)
+ALERT_NETWORK_AFTER_SEC = _raw.get("alert_network_after_sec", 180)
+ALERT_RECOVER_HOLD_SEC = _raw.get("alert_recover_hold_sec", 30)

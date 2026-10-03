@@ -11,12 +11,13 @@ import signal
 import sys
 import threading
 import time
-from collections import defaultdict, deque
+from collections import OrderedDict, defaultdict, deque
 
 import paho.mqtt.client as mqtt
 
 import config
 import db
+import health
 import pdu_encoder
 import pdu_parser
 import telegram
@@ -42,8 +43,10 @@ _send_lock = threading.Lock()
 _ref_counter = random.randint(1, 255)  # TP-reference для UDH (multipart)
 
 _status_cache = {}     # status topic -> (время получения, dict последнего статуса шлюза)
-_expected_offline = {}  # availability topic -> время команды reboot (подавляем алерт offline)
-EXPECTED_REBOOT_SEC = 60
+
+# Одно «живое» сообщение на команду: бот редактирует его по ходу дела (⏳ → 📤 → ✅)
+_progress = OrderedDict()  # (вид, id) -> message_id в Telegram
+_PROGRESS_MAX = 200
 
 USAGE = "Использование: <code>/send +375291234567 Текст сообщения</code>"
 _forward_pending = {}  # id -> (gateway name, action)
@@ -103,7 +106,7 @@ def on_connect(client, userdata, flags, reason_code, properties):
 
 
 def handle_availability(topic, msg):
-    """React to a gateway's LWT/birth message: alert Telegram on transitions."""
+    """Gateway LWT/birth message: update health (debounced alerts live in health.py)."""
     gateway = config.AVAILABILITY_TOPICS.get(topic)
     if gateway is None:
         return
@@ -115,28 +118,13 @@ def handle_availability(topic, msg):
 
     prev = _availability.get(topic)
     _availability[topic] = state
-
-    if prev == state:
-        return  # без изменений (в т.ч. дубликат retained-сообщения)
-
-    if prev is None and state == "online":
-        # первое известие о шлюзе, он в сети — это норма, не шумим
-        log.info("Gateway %s is online (baseline)", gateway["name"])
-        return
-
-    log.info("Gateway %s availability: %s -> %s", gateway["name"], prev, state)
-    if state == "offline" and time.time() - _expected_offline.pop(topic, 0) < EXPECTED_REBOOT_SEC:
-        return  # плановая перезагрузка по команде из Telegram — не алертим, придёт «снова в сети»
-    telegram.send_availability(
-        gateway["name"],
-        state == "online",
-        gateway["telegram_bot_token"],
-        gateway["telegram_chat_id"],
-    )
+    if prev != state:
+        log.info("Gateway %s availability: %s -> %s", gateway["name"], prev, state)
+    health.set_online(gateway, state == "online")
 
 
 def handle_status(topic, msg):
-    """Track cellular network registration/operator; alert Telegram on changes."""
+    """Track cellular network registration/operator for health and command gating."""
     gateway = config.STATUS_TOPICS.get(topic)
     if gateway is None:
         return
@@ -155,33 +143,36 @@ def handle_status(topic, msg):
         operator = prev[1]  # оператора не удалось прочитать — это не смена оператора
     _network[topic] = (registered, operator)
 
-    if prev == (registered, operator):
-        return
-
-    if prev is None:
-        # первое известие: нормальное состояние не комментируем, проблему — сообщаем
-        log.info("Gateway %s network baseline: registered=%s operator=%s",
-                 gateway["name"], registered, operator)
-        if registered:
-            return
-    else:
+    if prev != (registered, operator):
         log.info("Gateway %s network: %s -> %s", gateway["name"], prev, (registered, operator))
-
-    telegram.send_network(
-        gateway["name"],
-        registered,
-        operator,
-        roaming,
-        prev[1] if prev and prev[0] else None,
-        gateway["telegram_bot_token"],
-        gateway["telegram_chat_id"],
-    )
+    health.set_network(gateway, registered, operator, roaming)
 
 
 # ── Outgoing SMS ──────────────────────────────────────
 
 def _reply(gateway, message):
     telegram.send_text(message, gateway["telegram_bot_token"], gateway["telegram_chat_id"])
+
+
+def _progress_start(key, gateway, text):
+    """Send a status message that later updates edit in place."""
+    mid = telegram.send_message(gateway["telegram_bot_token"], gateway["telegram_chat_id"], text)
+    if mid is not None:
+        with _send_lock:
+            _progress[key] = mid
+            while len(_progress) > _PROGRESS_MAX:
+                _progress.popitem(last=False)
+
+
+def _progress_update(key, gateway, text, final=True):
+    """Edit the progress message; fall back to a new message if it is gone."""
+    with _send_lock:
+        mid = _progress.pop(key, None) if final else _progress.get(key)
+    if mid is not None and telegram.edit_message(
+        gateway["telegram_bot_token"], gateway["telegram_chat_id"], mid, text
+    ):
+        return
+    _reply(gateway, text)
 
 
 def _next_reference():
@@ -257,6 +248,9 @@ def _fmt_status(gateway, online, age, st):
     if st.get("last_error"):
         lines.append(f"Последняя ошибка: {esc(str(st['last_error']))}")
     lines.append(f"Heap: {st.get('free_heap', 0) // 1024} КБ")
+    count, total = health.incidents(gateway)
+    if count:
+        lines.append(f"Сбоев за 24 ч: {count} (суммарно {health.fmt_duration(total)})")
     return "\n".join(lines)
 
 
@@ -288,13 +282,12 @@ def handle_control_command(gateway, command):
         _reply(gateway, f"❌ <b>{name}</b> недоступен (offline), команда не отправлена.")
         return
 
-    if command == "reboot":
-        _expected_offline[gateway["availability_topic"]] = time.time()
     info = _client.publish(gateway["cmd_topic"], command, qos=1)
     if info.rc != mqtt.MQTT_ERR_SUCCESS:
-        _expected_offline.pop(gateway["availability_topic"], None)
         _reply(gateway, "❌ Не удалось передать команду шлюзу (MQTT).")
         return
+    if command == "reboot":
+        health.expect_reboot(gateway)  # сообщим, когда вернётся
 
     log.info("Command %s sent to %s", command, gateway["name"])
     if command == "reboot":
@@ -335,11 +328,12 @@ def handle_ussd_command(gateway, arg):
 
     log.info("USSD #%d %s via %s", req_id, "cancel" if cancel else arg, gateway["name"])
     _ussd_pending[req_id] = gateway["name"]
-    _reply(gateway, "⏳ Жду ответ оператора…")
+    _progress_start(("ussd", req_id), gateway, "⏳ Жду ответ оператора…")
 
     def on_timeout():
         if _ussd_pending.pop(req_id, None) is not None:
-            _reply(gateway, f"❌ Нет ответа от <b>{name}</b> на USSD-запрос.")
+            _progress_update(("ussd", req_id), gateway,
+                             f"❌ Нет ответа от <b>{name}</b> на USSD-запрос.")
 
     timer = threading.Timer(config.USSD_TIMEOUT_SEC, on_timeout)
     timer.daemon = True
@@ -368,7 +362,7 @@ def handle_ussd_result(topic, msg):
 
     if result.get("status") != "ok":
         error = telegram.escape_html(str(result.get("error", "неизвестная ошибка")))
-        _reply(gateway, f"❌ USSD: {error}")
+        _progress_update(("ussd", req_id), gateway, f"❌ USSD: {error}")
         return
 
     n = int(result.get("n", 0))
@@ -382,7 +376,7 @@ def handle_ussd_result(topic, msg):
         body += "\n\n<i>Сессия завершена оператором</i>"
     elif n == 4:
         body += "\n\n<i>Операция не поддерживается</i>"
-    _reply(gateway, "📟 " + body)
+    _progress_update(("ussd", req_id), gateway, "📟 " + body)
 
 
 def handle_forward_command(gateway, args):
@@ -438,12 +432,13 @@ def handle_forward_command(gateway, args):
 
     log.info("Forward #%d %s via %s", req_id, action, gateway["name"])
     _forward_pending[req_id] = (gateway["name"], action, affected)
-    _reply(gateway, "⏳ Запрашиваю у оператора (может занять до минуты)…")
+    _progress_start(("fwd", req_id), gateway, "⏳ Запрашиваю у оператора (может занять до минуты)…")
 
     def on_timeout():
         if _forward_pending.pop(req_id, None) is not None:
-            _reply(gateway, f"❌ Нет ответа от <b>{name}</b> по переадресации. "
-                            "Проверьте состояние командой /forward.")
+            _progress_update(("fwd", req_id), gateway,
+                             f"❌ Нет ответа от <b>{name}</b> по переадресации. "
+                             "Проверьте состояние командой /forward.")
 
     timer = threading.Timer(config.FORWARD_TIMEOUT_SEC, on_timeout)
     timer.daemon = True
@@ -456,14 +451,15 @@ def handle_forward_result(topic, msg):
         return
 
     result = json.loads(msg.payload.decode())
-    pending = _forward_pending.pop(int(result["id"]), None)
+    req_id = int(result["id"])
+    pending = _forward_pending.pop(req_id, None)
     if pending is None:
         return
     action, affected = pending[1], pending[2]
 
     if result.get("status") != "ok":
         error = telegram.escape_html(str(result.get("error", "неизвестная ошибка")))
-        _reply(gateway, f"❌ Переадресация: {error}")
+        _progress_update(("fwd", req_id), gateway, f"❌ Переадресация: {error}")
         return
 
     forwards = {f["reason"]: f for f in result.get("forwards", [])}
@@ -486,7 +482,8 @@ def handle_forward_result(topic, msg):
         header = "⚠️ Оператор не подтвердил переадресацию"
     elif action == "off" and any(forwards.get(r, {}).get("active") for r in affected):
         header = "⚠️ Переадресация осталась включённой"
-    _reply(gateway, f"{header} — <b>{telegram.escape_html(gateway['name'])}</b>\n" + "\n".join(lines))
+    _progress_update(("fwd", req_id), gateway,
+                     f"{header} — <b>{telegram.escape_html(gateway['name'])}</b>\n" + "\n".join(lines))
 
 
 def handle_send_command(gateway, parts):
@@ -534,15 +531,17 @@ def handle_send_command(gateway, parts):
         return
 
     log.info("Send #%d to %s via %s (%d parts)", msg_id, number, gateway["name"], len(pdus))
-    _reply(gateway, f"⏳ Отправляю на <b>{telegram.escape_html(number)}</b>"
+    _progress_start(("send", msg_id), gateway,
+                    f"⏳ Отправляю на <b>{telegram.escape_html(number)}</b>"
                     + (f" ({len(pdus)} ч.)" if len(pdus) > 1 else ""))
 
     def on_timeout():
         if db.is_pending(msg_id):
             db.fail_pending(msg_id)
             log.warning("Send #%d: no result from gateway", msg_id)
-            _reply(gateway, f"❌ Нет ответа от шлюза <b>{name}</b>, статус отправки на "
-                            f"{telegram.escape_html(number)} неизвестен.")
+            _progress_update(("send", msg_id), gateway,
+                             f"❌ Нет ответа от шлюза <b>{name}</b>, статус отправки на "
+                             f"{telegram.escape_html(number)} неизвестен.")
 
     timer = threading.Timer(config.SEND_RESULT_TIMEOUT_SEC, on_timeout)
     timer.daemon = True
@@ -568,11 +567,12 @@ def handle_send_result(topic, msg):
     to = telegram.escape_html(row["recipient"])
     log.info("Send #%d result: %s %s", msg_id, result.get("status"), result.get("error", ""))
     if ok:
-        _reply(gateway, f"📤 Отправлено на <b>{to}</b>, жду отчёт о доставке")
+        _progress_update(("send", msg_id), gateway,
+                         f"📤 Отправлено на <b>{to}</b>, жду отчёт о доставке", final=False)
     else:
         error = telegram.escape_html(str(result.get("error", "неизвестная ошибка")))
         extra = f" (отправлено частей: {len(refs)} из {row['parts_total']})" if refs else ""
-        _reply(gateway, f"❌ Не отправлено на <b>{to}</b>: {error}{extra}")
+        _progress_update(("send", msg_id), gateway, f"❌ Не отправлено на <b>{to}</b>: {error}{extra}")
 
 
 def handle_report(topic, msg):
@@ -596,10 +596,12 @@ def handle_report(topic, msg):
 
     row, final = outcome
     to = telegram.escape_html(row["recipient"])
+    key = ("send", row["id"])
     if final == "delivered":
-        _reply(gateway, f"✅ Доставлено: <b>{to}</b>")
+        _progress_update(key, gateway, f"✅ Доставлено: <b>{to}</b>")
     else:
-        _reply(gateway, f"⚠️ Не доставлено: <b>{to}</b> (код оператора 0x{report['status']:02X})")
+        _progress_update(key, gateway,
+                         f"⚠️ Не доставлено: <b>{to}</b> (код оператора 0x{report['status']:02X})")
 
 
 def on_message(client, userdata, msg):
@@ -718,6 +720,9 @@ def main():
     # Cleanup thread
     cleanup_thread = threading.Thread(target=cleanup_loop, daemon=True)
     cleanup_thread.start()
+
+    # Алерты о состоянии шлюзов (с задержкой, см. health.py)
+    threading.Thread(target=health.run_loop, args=(lambda: running,), daemon=True).start()
 
     # Меню команд бота — только в чате своего шлюза
     for gw in config.BOTS:

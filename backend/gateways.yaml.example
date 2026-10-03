@@ -12,6 +12,12 @@ send_result_timeout_sec: 120   # сколько ждать ответа шлюз
 ussd_timeout_sec: 60
 forward_timeout_sec: 180
 
+# Алерты в Telegram: сообщаем о проблеме (offline / SIM не в сети), только если она держится
+# дольше порога; короткие перезагрузки и провалы остаются в журнале и в /status.
+alert_offline_after_sec: 120
+alert_network_after_sec: 180
+alert_recover_hold_sec: 30     # сколько шлюз должен быть здоров, чтобы объявить восстановление
+
 # Каждый шлюз — один параметр mqtt_base; все топики строятся от него:
 #   <mqtt_base>/incoming, /status, /availability, /cmd, /send, /send-result,
 #   /report, /ussd, /ussd-result, /forward, /forward-result, /debug

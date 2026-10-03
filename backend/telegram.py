@@ -17,30 +17,52 @@ def _escape_html(text: str) -> str:
 escape_html = _escape_html
 
 
-def _post(bot_token: str, chat_id: str, message: str) -> bool:
-    """Send an HTML message via the Telegram Bot API. Returns True on success."""
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-
+def _call(bot_token: str, method: str, payload: dict):
+    """Call a Bot API method. Returns the parsed response dict, or None on failure."""
     try:
         resp = requests.post(
-            url,
+            f"https://api.telegram.org/bot{bot_token}/{method}", json=payload, timeout=10
+        )
+        if resp.ok:
+            return resp.json()
+        log.error("Telegram %s error %d: %s", method, resp.status_code, resp.text)
+    except Exception as e:
+        log.error("Telegram %s failed: %s", method, _safe_error(e))
+    return None
+
+
+def _post(bot_token: str, chat_id: str, message: str) -> bool:
+    """Send an HTML message via the Telegram Bot API. Returns True on success."""
+    return send_message(bot_token, chat_id, message) is not None
+
+
+def send_message(bot_token: str, chat_id: str, message: str):
+    """Send an HTML message. Returns its message_id, or None on failure."""
+    data = _call(
+        bot_token, "sendMessage", {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
+    )
+    return data["result"]["message_id"] if data else None
+
+
+def edit_message(bot_token: str, chat_id: str, message_id: int, message: str) -> bool:
+    """Replace the text of an already sent message. 'Not modified' counts as success."""
+    try:
+        resp = requests.post(
+            f"https://api.telegram.org/bot{bot_token}/editMessageText",
             json={
                 "chat_id": chat_id,
+                "message_id": message_id,
                 "text": message,
                 "parse_mode": "HTML",
             },
             timeout=10,
         )
-
-        if resp.ok:
+        if resp.ok or "message is not modified" in resp.text:
             return True
-        else:
-            log.error("Telegram API error %d: %s", resp.status_code, resp.text)
-            return False
-
-    except Exception:
-        log.exception("Telegram send failed")
-        return False
+        log.error("Telegram editMessageText error %d: %s", resp.status_code, resp.text)
+    except Exception as e:
+        log.error("Telegram editMessageText failed: %s", _safe_error(e))
+    return False
 
 
 def send(
@@ -59,49 +81,6 @@ def send(
 
     if _post(bot_token, chat_id, message):
         log.info("Telegram sent: SMS from %s", sender)
-        return True
-    return False
-
-
-def send_availability(name: str, online: bool, bot_token: str, chat_id: str) -> bool:
-    """Notify Telegram that a gateway went online/offline. Returns True on success."""
-    if online:
-        message = f"✅ <b>{_escape_html(name)}</b> снова в сети"
-    else:
-        message = f"⚠️ <b>{_escape_html(name)}</b> недоступен (offline)"
-
-    if _post(bot_token, chat_id, message):
-        log.info("Telegram alert: %s -> %s", name, "online" if online else "offline")
-        return True
-    return False
-
-
-def send_network(
-    name: str,
-    registered: bool,
-    operator: str,
-    roaming: bool,
-    prev_operator,
-    bot_token: str,
-    chat_id: str,
-) -> bool:
-    """Notify Telegram about SIM network registration changes. Returns True on success."""
-    n = _escape_html(name)
-    op = _escape_html(operator) if operator else "неизвестный оператор"
-    if not registered:
-        message = f"📵 <b>{n}</b>: SIM-карта отключена от сети"
-    elif prev_operator is not None and prev_operator != operator:
-        message = (
-            f"🔄 <b>{n}</b>: смена оператора "
-            f"{_escape_html(prev_operator) or '?'} → {op}"
-        )
-    else:
-        message = f"📶 <b>{n}</b>: SIM-карта в сети — {op}"
-    if registered and roaming:
-        message += " (роуминг)"
-
-    if _post(bot_token, chat_id, message):
-        log.info("Telegram alert: %s network registered=%s operator=%s", name, registered, operator)
         return True
     return False
 
