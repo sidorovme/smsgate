@@ -15,12 +15,57 @@ def _load(path: str) -> dict:
 
 _CONFIG_PATH = os.environ.get("SMSGATE_CONFIG", "gateways.yaml")
 
+# Числовые настройки, которые можно задать переменной окружения (имя = ключ в верхнем регистре).
+_TUNABLES = (
+    "multipart_timeout_sec", "send_max_parts", "send_rate_limit_per_min",
+    "send_result_timeout_sec", "ussd_timeout_sec", "forward_timeout_sec",
+    "alert_offline_after_sec", "alert_network_after_sec", "alert_recover_hold_sec",
+)
+
+
+def _from_env() -> dict:
+    """Конфиг из переменных окружения (для Docker/TrueNAS).
+
+    MQTT_BROKER, MQTT_PORT, DB_PATH, а также числовые настройки (SEND_MAX_PARTS и т.д.).
+    Шлюзы: GATEWAY_1_NAME, GATEWAY_1_MQTT_BASE, GATEWAY_1_TELEGRAM_BOT_TOKEN,
+    GATEWAY_1_TELEGRAM_CHAT_ID, затем GATEWAY_2_* и так далее.
+    """
+    env = os.environ
+    raw = {"mqtt": {"broker": env["MQTT_BROKER"]}, "gateways": []}
+    if env.get("MQTT_PORT"):
+        raw["mqtt"]["port"] = int(env["MQTT_PORT"])
+    if env.get("DB_PATH"):
+        raw["db_path"] = env["DB_PATH"]
+    for key in _TUNABLES:
+        if env.get(key.upper()):
+            raw[key] = int(env[key.upper()])
+    n = 1
+    while f"GATEWAY_{n}_MQTT_BASE" in env:
+        p = f"GATEWAY_{n}_"
+        raw["gateways"].append({
+            "name": env.get(p + "NAME", f"gate-{n}"),
+            "mqtt_base": env[p + "MQTT_BASE"],
+            "telegram_bot_token": env[p + "TELEGRAM_BOT_TOKEN"],
+            "telegram_chat_id": env[p + "TELEGRAM_CHAT_ID"],
+        })
+        n += 1
+    return raw
+
+
 try:
     _raw = _load(_CONFIG_PATH)
 except FileNotFoundError:
-    print(f"Config file not found: {_CONFIG_PATH}", file=sys.stderr)
-    print("Copy gateways.yaml.example to gateways.yaml and fill in your values.", file=sys.stderr)
-    sys.exit(1)
+    if "MQTT_BROKER" in os.environ and "GATEWAY_1_MQTT_BASE" in os.environ:
+        try:
+            _raw = _from_env()
+        except (KeyError, ValueError) as e:
+            print(f"Invalid environment configuration: {e!r}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        print(f"Config file not found: {_CONFIG_PATH}", file=sys.stderr)
+        print("Copy gateways.yaml.example to gateways.yaml and fill in your values,", file=sys.stderr)
+        print("or set MQTT_BROKER and GATEWAY_1_* environment variables.", file=sys.stderr)
+        sys.exit(1)
 
 # ── MQTT ──────────────────────────────────────────────
 MQTT_BROKER = _raw["mqtt"]["broker"]

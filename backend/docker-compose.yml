@@ -1,5 +1,5 @@
 # Запуск бэкенда на TrueNAS (Apps → Discover Apps → ⋮ → Install via YAML)
-# Перед стартом: в /mnt/POOL/apps/smsgate лежат gateways.yaml (db_path: "/data/sms.db") и, при желании, старый sms.db.
+# Конфиг — переменные окружения ниже; /data нужен только для sms.db.
 services:
   smsgate-backend:
     image: ghcr.io/sidorovme/smsgate-backend:latest
@@ -7,5 +7,12 @@ services:
     restart: unless-stopped
     environment:
       TZ: Europe/Minsk
+      MQTT_BROKER: "192.168.1.2"
+      MQTT_PORT: "1883"
+      GATEWAY_1_NAME: "gate-yauheni"
+      GATEWAY_1_MQTT_BASE: "sms/gate-yauheni"
+      GATEWAY_1_TELEGRAM_BOT_TOKEN: "123456:ABC-DEF..."
+      GATEWAY_1_TELEGRAM_CHAT_ID: "-100123456789"
+      # GATEWAY_2_NAME / _MQTT_BASE / _TELEGRAM_BOT_TOKEN / _TELEGRAM_CHAT_ID — второй шлюз
     volumes:
       - /mnt/POOL/apps/smsgate:/data
