@@ -1,0 +1,11 @@
+# Запуск бэкенда на TrueNAS (Apps → Discover Apps → ⋮ → Install via YAML)
+# Перед стартом: в /mnt/POOL/apps/smsgate лежат gateways.yaml (db_path: "/data/sms.db") и, при желании, старый sms.db.
+services:
+  smsgate-backend:
+    image: ghcr.io/sidorovme/smsgate-backend:latest
+    container_name: smsgate-backend
+    restart: unless-stopped
+    environment:
+      TZ: Europe/Minsk
+    volumes:
+      - /mnt/POOL/apps/smsgate:/data
