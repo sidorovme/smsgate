@@ -9,7 +9,7 @@
 #define MQTT_TOPIC                MQTT_BASE "/incoming"        // входящие SMS (PDU)
 #define MQTT_STATUS_TOPIC         MQTT_BASE "/status"          // метрики устройства (retained)
 #define MQTT_AVAILABILITY_TOPIC   MQTT_BASE "/availability"    // online/offline (LWT, retained)
-#define MQTT_CMD_TOPIC            MQTT_BASE "/cmd"             // команды: reboot, reset-modem, status
+#define MQTT_CMD_TOPIC            MQTT_BASE "/cmd"             // команды: reboot, reset-modem, modem-off, modem-on, status
 #define MQTT_SEND_TOPIC           MQTT_BASE "/send"            // задания на отправку SMS (JSON с PDU)
 #define MQTT_SEND_RESULT_TOPIC    MQTT_BASE "/send-result"     // результат отправки
 #define MQTT_REPORT_TOPIC         MQTT_BASE "/report"          // отчёты о доставке (PDU)

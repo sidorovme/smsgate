@@ -79,7 +79,9 @@ HELP = (
     "/forward — переадресация звонков, подробности: <code>/forward help</code>\n"
     "/status — состояние шлюза\n"
     "/reboot — перезагрузить шлюз\n"
-    "/reset_modem — перезапустить модем"
+    "/reset_modem — перезапустить модем\n"
+    "/modem_off — выключить модем (SIM не в сети, SMS/USSD не работают)\n"
+    "/modem_on — включить модем"
 )
 
 
@@ -131,6 +133,11 @@ def handle_status(topic, msg):
 
     status = json.loads(msg.payload.decode())
     _status_cache[topic] = (time.time(), status)
+    modem_off = status.get("modem_enabled") is False
+    health.set_modem_off(gateway, modem_off)
+    if modem_off:
+        _network[topic] = (False, "")
+        return
     if status.get("net_stat", -1) == -1:
         return  # прошивка без поддержки или модем ещё не опрошен
 
@@ -210,6 +217,10 @@ def handle_command(gateway, text):
         handle_status_command(gateway)
     elif cmd in ("/reboot", "/reset_modem", "/reset-modem"):
         handle_control_command(gateway, "reboot" if cmd == "/reboot" else "reset-modem")
+    elif cmd in ("/modem_off", "/modem-off"):
+        handle_control_command(gateway, "modem-off")
+    elif cmd in ("/modem_on", "/modem-on"):
+        handle_control_command(gateway, "modem-on")
     elif cmd in ("/help", "/start"):
         _reply(gateway, HELP)
 
@@ -226,7 +237,9 @@ def _fmt_status(gateway, online, age, st):
     if not online:
         lines.append(f"<i>последние известные данные ({_fmt_uptime(age)} назад)</i>")
 
-    if st.get("net_stat", -1) == -1:
+    if st.get("modem_enabled") is False:
+        net = "модем выключен"
+    elif st.get("net_stat", -1) == -1:
         net = "нет данных"
     elif st.get("net_registered"):
         net = esc(st.get("net_operator") or "?") + (" (роуминг)" if st.get("net_roaming") else "")
@@ -238,7 +251,10 @@ def _fmt_status(gateway, online, age, st):
     if csq != 99 and st.get("net_registered"):
         lines.append(f"Сигнал: {-113 + 2 * csq} dBm (CSQ {csq}/31)")
 
-    lines.append(f"Модем: {'OK' if st.get('sim900_ok') else '❌ не отвечает'}")
+    if st.get("modem_enabled") is False:
+        lines.append("Модем: ⏻ выключен (<code>/modem_on</code> — включить)")
+    else:
+        lines.append(f"Модем: {'OK' if st.get('sim900_ok') else '❌ не отвечает'}")
     lines.append(f"Wi-Fi: {st.get('wifi_rssi')} dBm, {esc(str(st.get('wifi_ip', '?')))}")
     lines.append(f"Uptime: {_fmt_uptime(st.get('uptime_sec', 0))}")
     lines.append(
@@ -275,6 +291,11 @@ def handle_status_command(gateway):
     _reply(gateway, _fmt_status(gateway, online, time.time() - ts, st))
 
 
+def _modem_off(gateway):
+    cached = _status_cache.get(gateway["status_topic"])
+    return cached is not None and cached[1].get("modem_enabled") is False
+
+
 def handle_control_command(gateway, command):
     """Forward reboot / reset-modem to the gateway (only if it is online)."""
     name = telegram.escape_html(gateway["name"])
@@ -292,6 +313,10 @@ def handle_control_command(gateway, command):
     log.info("Command %s sent to %s", command, gateway["name"])
     if command == "reboot":
         _reply(gateway, f"🔄 Перезагружаю <b>{name}</b>, сообщу, когда вернётся в сеть.")
+    elif command == "modem-off":
+        _reply(gateway, f"⏻ Выключаю модем <b>{name}</b>. Включить: <code>/modem_on</code>")
+    elif command == "modem-on":
+        _reply(gateway, f"⏻ Включаю модем <b>{name}</b> (около 10–15 с).")
     else:
         _reply(gateway, f"🔄 Перезапускаю модем <b>{name}</b> (около 10–15 с).")
 
@@ -308,6 +333,9 @@ def handle_ussd_command(gateway, arg):
 
     if _availability.get(gateway["availability_topic"]) != "online":
         _reply(gateway, f"❌ <b>{name}</b> недоступен (offline). Повторите позже.")
+        return
+    if _modem_off(gateway):
+        _reply(gateway, f"❌ Модем <b>{name}</b> выключен. Включить: <code>/modem_on</code>")
         return
     net = _network.get(gateway["status_topic"])
     if not cancel and net is not None and not net[0]:
@@ -413,6 +441,9 @@ def handle_forward_command(gateway, args):
     if _availability.get(gateway["availability_topic"]) != "online":
         _reply(gateway, f"❌ <b>{name}</b> недоступен (offline). Повторите позже.")
         return
+    if _modem_off(gateway):
+        _reply(gateway, f"❌ Модем <b>{name}</b> выключен. Включить: <code>/modem_on</code>")
+        return
     net = _network.get(gateway["status_topic"])
     if net is not None and not net[0]:
         _reply(gateway, f"❌ SIM-карта <b>{name}</b> не в сети. Повторите позже.")
@@ -508,6 +539,9 @@ def handle_send_command(gateway, parts):
     # Шлюз офлайн / SIM не в сети — отклоняем сразу, пользователь повторит позже
     if _availability.get(gateway["availability_topic"]) != "online":
         _reply(gateway, f"❌ <b>{name}</b> недоступен (offline), SMS не отправлено. Повторите позже.")
+        return
+    if _modem_off(gateway):
+        _reply(gateway, f"❌ Модем <b>{name}</b> выключен. Включить: <code>/modem_on</code>")
         return
     net = _network.get(gateway["status_topic"])
     if net is not None and not net[0]:
