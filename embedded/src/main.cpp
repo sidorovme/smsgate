@@ -3,6 +3,7 @@
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <esp_task_wdt.h>
+#include <Preferences.h>
 #include <vector>
 #include <stdarg.h>
 #include "config.h"
@@ -19,6 +20,8 @@ uint32_t smsSent       = 0;
 uint32_t smsPending    = 0;
 String   lastError     = "";
 bool     sim900Ok      = false;
+bool     modemEnabled  = true;   // false — модем выключен командой modem-off (хранится в NVS)
+Preferences prefs;
 uint32_t startTime     = 0;
 uint32_t lastPollMs    = 0;
 uint32_t lastDisplayMs = 0;
@@ -39,7 +42,7 @@ uint32_t lastAutoResetMs = 0;  // последний автоматически�
 
 // Команды из MQTT выполняются в loop(), а не в callback (тяжёлая работа
 // внутри колбэка PubSubClient нежелательна).
-enum PendingCmd { CMD_NONE, CMD_REBOOT, CMD_RESET_MODEM };
+enum PendingCmd { CMD_NONE, CMD_REBOOT, CMD_RESET_MODEM, CMD_MODEM_OFF, CMD_MODEM_ON };
 volatile PendingCmd pendingCmd = CMD_NONE;
 
 // Очередь заданий на отправку SMS из MQTT. Тяжёлая работа (AT+CMGS, до минуты)
@@ -582,7 +585,8 @@ void processSendJob(const SendJob& job) {
     String err = job.error;
 
     if (err.length() == 0) {
-        if (!sim900Ok) err = "modem not ready";
+        if (!modemEnabled) err = "modem off";
+        else if (!sim900Ok) err = "modem not ready";
         else if (netStat != 1 && netStat != 5) err = "no network";
     }
 
@@ -704,7 +708,8 @@ void processUssdJob(const UssdJob& job) {
     Serial.printf("[USSD] Job %ld: %s\n", job.id, job.cancel ? "cancel" : job.code.c_str());
 
     String err;
-    if (!sim900Ok) err = "modem not ready";
+    if (!modemEnabled) err = "modem off";
+        else if (!sim900Ok) err = "modem not ready";
     else if (!job.cancel && netStat != 1 && netStat != 5) err = "no network";
 
     if (err.length() > 0) {
@@ -823,7 +828,8 @@ void processFwdJob(const FwdJob& job) {
     Serial.printf("[FWD] Job %ld: %s %s\n", job.id, job.action.c_str(), job.number.c_str());
 
     String err;
-    if (!sim900Ok) err = "modem not ready";
+    if (!modemEnabled) err = "modem off";
+        else if (!sim900Ok) err = "modem not ready";
     else if (netStat != 1 && netStat != 5) err = "no network";
 
     bool ok = true;
@@ -905,6 +911,7 @@ void publishStatus() {
     doc["last_error"]    = lastError;
     doc["free_heap"]     = ESP.getFreeHeap();
     doc["sim900_ok"]     = sim900Ok;
+    doc["modem_enabled"] = modemEnabled;
     doc["net_stat"]      = netStat;
     doc["net_registered"] = (netStat == 1 || netStat == 5);
     doc["net_roaming"]   = (netStat == 5);
@@ -964,6 +971,32 @@ void resetModem() {
     publishStatus();
 }
 
+// Выключить модем по питанию (команда modem-off). Состояние сохраняется в NVS —
+// после перезагрузки платы модем остаётся выключенным.
+void modemOff() {
+    Serial.println("[CMD] modem-off");
+    modemEnabled = false;
+    prefs.putBool("modem_on", false);
+    sim900Ok = false;
+    netStat = -1;
+    netOperator = "";
+    netCsq = 99;
+    netNoReply = 0;
+    smsPending = 0;
+    digitalWrite(SIM_POWER_PIN, LOW);
+    Serial.println("[SIM] Power OFF");
+    publishStatus();
+}
+
+// Включить модем (команда modem-on): питание + инициализация.
+void modemOn() {
+    Serial.println("[CMD] modem-on");
+    modemEnabled = true;
+    prefs.putBool("modem_on", true);
+    lastError = "";
+    resetModem();
+}
+
 // Callback входящих MQTT-сообщений на MQTT_CMD_TOPIC.
 // Только помечает команду; выполнение — в loop().
 void onMqttMessage(char* topic, byte* payload, unsigned int length) {
@@ -991,6 +1024,10 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
         pendingCmd = CMD_REBOOT;
     } else if (cmd == "reset-modem") {
         pendingCmd = CMD_RESET_MODEM;
+    } else if (cmd == "modem-off") {
+        pendingCmd = CMD_MODEM_OFF;
+    } else if (cmd == "modem-on") {
+        pendingCmd = CMD_MODEM_ON;
     } else if (cmd == "status") {
         publishStatus();
     } else {
@@ -1029,28 +1066,37 @@ void setup() {
     // SIM900 — включить питание модема
     // Всегда с power cycle: после программной перезагрузки ESP32 зависший модем
     // иначе остаётся без сброса и не отвечает на AT (цикл перезагрузок).
+    prefs.begin("smsgate", false);
+    modemEnabled = prefs.getBool("modem_on", true);
     pinMode(SIM_POWER_PIN, OUTPUT);
     digitalWrite(SIM_POWER_PIN, LOW);
     Serial.println("[SIM] Power OFF");
-    delay(2000);
-    digitalWrite(SIM_POWER_PIN, HIGH);
-    Serial.println("[SIM] Power ON (D4 HIGH)");
-    delay(3000);  // дать модему время запуститься
-
     simSerial.setRxBufferSize(1024);
     simSerial.begin(SIM_BAUD, SERIAL_8N1, SIM_RX_PIN, SIM_TX_PIN);
-    if (!initSIM900()) {
-        displayBoot("SIM900", false);
-        Serial.println("[SIM] Init failed, will reboot in 10s");
-        delay(10000);
-        ESP.restart();
-    }
-    displayBoot("SIM900", true);
 
-    // Проверить SMS оставшиеся на SIM с прошлого раза
-    pollPendingSMS();
-    updateNetwork();
-    publishStatus();
+    if (!modemEnabled) {
+        Serial.println("[SIM] Modem disabled by command (modem-off), staying off");
+        displayBoot("SIM900 off", true);
+        publishStatus();
+    } else {
+        delay(2000);
+        digitalWrite(SIM_POWER_PIN, HIGH);
+        Serial.println("[SIM] Power ON (D4 HIGH)");
+        delay(3000);  // дать модему время запуститься
+
+        if (!initSIM900()) {
+            displayBoot("SIM900", false);
+            Serial.println("[SIM] Init failed, will reboot in 10s");
+            delay(10000);
+            ESP.restart();
+        }
+        displayBoot("SIM900", true);
+
+        // Проверить SMS оставшиеся на SIM с прошлого раза
+        pollPendingSMS();
+        updateNetwork();
+        publishStatus();
+    }
 
     displayBootReady();
     Serial.println("=== SMS Gateway ready ===");
@@ -1071,7 +1117,14 @@ void loop() {
         doReboot();
     } else if (pendingCmd == CMD_RESET_MODEM) {
         pendingCmd = CMD_NONE;
-        resetModem();
+        if (modemEnabled) resetModem();
+        else Serial.println("[CMD] reset-modem ignored: modem is off");
+    } else if (pendingCmd == CMD_MODEM_OFF) {
+        pendingCmd = CMD_NONE;
+        modemOff();
+    } else if (pendingCmd == CMD_MODEM_ON) {
+        pendingCmd = CMD_NONE;
+        modemOn();
     }
 
     // Задания на отправку SMS (по одному за итерацию)
@@ -1096,7 +1149,7 @@ void loop() {
     }
 
     // Периодический опрос неотправленных SMS
-    if (millis() - lastPollMs > POLL_INTERVAL_MS) {
+    if (modemEnabled && millis() - lastPollMs > POLL_INTERVAL_MS) {
         lastPollMs = millis();
         pollPendingSMS();
     }

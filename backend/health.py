@@ -36,6 +36,7 @@ class _State:
         self.gateway = gateway
         self.online = None          # None — ещё нет данных
         self.registered = None
+        self.modem_off = False      # модем выключен командой — не считаем сбоем сети
         self.operator = ""
         self.roaming = False
         self.since = {}             # причина -> когда началась (offline | network)
@@ -58,7 +59,7 @@ def _state(gateway):
 def _reasons(st):
     if st.online is False:
         return {"offline"}
-    if st.registered is False:
+    if st.registered is False and not st.modem_off:
         return {"network"}
     return set()
 
@@ -105,6 +106,14 @@ def set_network(gateway, registered: bool, operator: str, roaming: bool):
         st.operator = operator or st.operator
         st.roaming = roaming
         _apply(st)
+
+
+def set_modem_off(gateway, modem_off: bool):
+    with _lock:
+        st = _state(gateway)
+        if st.modem_off != modem_off:
+            st.modem_off = modem_off
+            _apply(st)
 
 
 def expect_reboot(gateway):

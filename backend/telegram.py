@@ -160,6 +160,8 @@ BOT_COMMANDS = [
     {"command": "send", "description": "Отправить SMS: /send +375... текст"},
     {"command": "reboot", "description": "Перезагрузить шлюз"},
     {"command": "reset_modem", "description": "Перезапустить модем"},
+    {"command": "modem_off", "description": "Выключить модем"},
+    {"command": "modem_on", "description": "Включить модем"},
     {"command": "help", "description": "Список команд"},
 ]
 
